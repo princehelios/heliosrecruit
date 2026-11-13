@@ -126,7 +126,7 @@ def _run(run_id: int, folder_id: str, rescreen: bool, file_ids: list[str] | None
         if not files:
             storage.log("info", "No resumes to screen in this folder.", run_id)
 
-        jobs = [(storage.create_screening(run_id, f["id"], f["name"], folder_id), f) for f in files]
+        jobs = [(storage.create_screening(run_id, f["id"], f["name"], folder_id, f.get("added")), f) for f in files]
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_RESUMES) as pool:
             for (sid, f) in jobs:
                 pool.submit(_safe_process, run, sid, f)

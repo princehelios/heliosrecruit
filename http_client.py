@@ -17,9 +17,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Enough sockets for the 3 pipeline workers + 8 gunicorn threads to share
+# Enough sockets for the 3 pipeline workers, 8 gunicorn threads and the
+# WorkDrive listing cache (up to 16 refreshers + 16 folder counters) to share
 # without ever queueing on the pool.
-_POOL_SIZE = 24
+_POOL_SIZE = 32
 
 _retry = Retry(
     total=2,

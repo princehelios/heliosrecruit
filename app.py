@@ -14,11 +14,13 @@ Run:  PORT=5001 python3 app.py
 import gzip
 import os
 import re
+import threading
 import traceback
 
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
+import activity
 import ai_scorer
 import config
 import email_fetcher
@@ -127,6 +129,19 @@ def _compress(response):
     response.headers["Content-Length"] = str(len(packed))
     return response
 
+
+def _warm_cache():
+    # Fill the WorkDrive listing cache in the background so the first visit
+    # to the Positions page is instant instead of waiting on ~20 Zoho calls.
+    try:
+        zoho_workdrive.browse(None, live=True)
+        activity.daily_activity()  # also lists every date folder for the dashboard chart
+    except Exception as e:  # noqa: BLE001 - warming is best-effort
+        print(f"WorkDrive cache warm-up skipped: {e}")
+
+
+threading.Thread(target=_warm_cache, name="wd-warm", daemon=True).start()
+
 REQUIRED_SCOPES = {
     "WorkDrive.files.READ": "Browse folders and download resumes",
     "WorkDrive.files.CREATE": "Create folders and upload resumes",
@@ -224,7 +239,8 @@ def api_status():
 
 @app.get("/api/browse")
 def api_browse():
-    data = zoho_workdrive.browse(request.args.get("folder_id") or None)
+    live = request.args.get("live", "").lower() in {"1", "true", "yes"}
+    data = zoho_workdrive.browse(request.args.get("folder_id") or None, live=live)
 
     jds = storage.list_jds()
     overview = storage.role_overview() if data["depth"] == 0 else {}
@@ -353,7 +369,7 @@ def api_roles():
     """Every position folder with its JD / sheet link, for the Form sheets page."""
     jds = storage.list_jds()
     roles = []
-    for f in zoho_workdrive.list_children(config.WORKDRIVE_ROOT_FOLDER_ID)["folders"]:
+    for f in zoho_workdrive.list_children(config.WORKDRIVE_ROOT_FOLDER_ID, cached=True)["folders"]:
         jd = jds.get(f["id"]) or {}
         roles.append({"id": f["id"], "name": f["name"], "has_jd": bool((jd.get("jd_text") or "").strip()),
                       "form_sheet_url": jd.get("form_sheet_url") or ""})
@@ -474,6 +490,12 @@ def api_dashboard():
     data["tokens"]["avg_tokens_per_resume"] = round(data["tokens"]["tokens_total"] / analysed) if analysed else 0
     data["recent_runs"] = [_with_cost(r) for r in storage.list_runs(limit=6)]
     return jsonify(data)
+
+
+@app.get("/api/activity")
+def api_activity():
+    """Resumes received and Google Form responses per day and position."""
+    return jsonify(activity.daily_activity())
 
 
 @app.get("/api/candidates")

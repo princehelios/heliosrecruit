@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import requests
 
@@ -83,8 +83,19 @@ def get_file(file_id: str) -> dict:
     }
 
 
-def list_children(folder_id: str) -> dict:
-    """{"folders": [...], "files": [...]} - files are resumes only."""
+def list_children(folder_id: str, *, cached: bool = False) -> dict:
+    """{"folders": [...], "files": [...]} - files are resumes only.
+
+    cached=True is for DISPLAY ONLY (folder cards, pickers): it may return a
+    listing up to _LIST_STALE_TTL old and refreshes it in the background.
+    Anything that acts on files (screening, moves, name checks) uses the
+    default live listing."""
+    if cached:
+        return _list_cached(folder_id)[0]
+    return _list_children_live(folder_id)
+
+
+def _list_children_live(folder_id: str) -> dict:
     url = f"{config.WORKDRIVE_API_BASE}/files/{folder_id}/files"
     folders, files = [], []
     # page[offset] is a 0-indexed RECORD offset, not a page number.
@@ -123,6 +134,72 @@ def list_children(folder_id: str) -> dict:
     folders.sort(key=lambda f: f.get("modified") or 0, reverse=True)
     files.sort(key=lambda f: f["name"].lower())
     return {"folders": folders, "files": files}
+
+
+# ---------------------------------------------------------------- listing cache
+# Listing one folder costs a Zoho round trip (~0.5-1.5 s, more for big folders
+# that need several pages); the Positions page needs one per position. Cached
+# listings are served instantly: fresh for _LIST_FRESH_TTL, then served stale
+# while a background refresh runs. Every write made through this module
+# (upload, create, rename, move, trash, delete) clears the whole cache, so the
+# app's own changes always show on the next load.
+
+_LIST_FRESH_TTL = 45
+_LIST_STALE_TTL = 30 * 60
+_list_cache: dict[str, tuple[float, dict]] = {}
+_list_inflight: dict[str, Future] = {}
+_list_lock = threading.Lock()
+_list_generation = 0
+_refresher = ThreadPoolExecutor(max_workers=16, thread_name_prefix="wd-list")
+
+
+def invalidate_listings() -> None:
+    global _list_generation
+    with _list_lock:
+        _list_cache.clear()
+        _list_inflight.clear()
+        _list_generation += 1
+
+
+def _fetch_into_cache(folder_id: str, generation: int) -> dict:
+    try:
+        data = _list_children_live(folder_id)
+    except BaseException:
+        with _list_lock:
+            if _list_generation == generation:
+                _list_inflight.pop(folder_id, None)
+        raise
+    with _list_lock:
+        # A write happened while this listing was in flight: don't cache it.
+        if _list_generation == generation:
+            _list_cache[folder_id] = (time.time(), data)
+            _list_inflight.pop(folder_id, None)
+    return data
+
+
+def _start_fetch(folder_id: str) -> Future:
+    """The in-flight fetch for folder_id, starting one if needed. Caller holds _list_lock."""
+    fut = _list_inflight.get(folder_id)
+    if fut is None:
+        fut = _refresher.submit(_fetch_into_cache, folder_id, _list_generation)
+        _list_inflight[folder_id] = fut
+    return fut
+
+
+def _list_cached(folder_id: str, *, live: bool = False) -> tuple[dict, bool]:
+    """(listing, is_stale). live=True waits for a fresh listing, joining a
+    refresh already in flight instead of starting a second one."""
+    now = time.time()
+    with _list_lock:
+        hit = _list_cache.get(folder_id)
+        age = now - hit[0] if hit else None
+        if hit and not live and age < _LIST_FRESH_TTL:
+            return hit[1], False
+        if hit and not live and age < _LIST_STALE_TTL:
+            _start_fetch(folder_id)
+            return hit[1], True
+        fut = _start_fetch(folder_id)
+    return fut.result(), False
 
 
 _FOLDER_CACHE_TTL = 300
@@ -168,27 +245,32 @@ def resolve_path(folder_id: str) -> list[dict]:
     raise OutsideRootError("That folder is not inside the configured resumes root folder.")
 
 
-def browse(folder_id: str | None) -> dict:
-    """Everything the UI needs to render one folder level."""
+def browse(folder_id: str | None, *, live: bool = False) -> dict:
+    """Everything the UI needs to render one folder level.
+
+    By default listings come from the cache (instant); the result's "stale"
+    flag says a background refresh is running, and the UI then asks again
+    with live=True to pick up the refreshed numbers."""
     folder_id = folder_id or config.WORKDRIVE_ROOT_FOLDER_ID
     with ThreadPoolExecutor(max_workers=2) as pool:
         path_future = pool.submit(resolve_path, folder_id)
-        children_future = pool.submit(list_children, folder_id)
+        children, stale = _list_cached(folder_id, live=live)
         path = path_future.result()  # raises OutsideRootError before anything is returned
-        children = children_future.result()
 
-    # Per-subfolder counts, fetched in parallel so a role with many date
-    # folders still loads quickly.
+    # Per-subfolder counts. All listings start at once, so a cold root page
+    # costs about one slow folder, not the sum of them.
     def count(f):
         try:
-            c = list_children(f["id"])
-            return {**f, "folder_count": len(c["folders"]), "resume_count": len(c["files"]),
-                    "file_ids": [x["id"] for x in c["files"]]}
+            c, s = _list_cached(f["id"], live=live)
+            return s, {**f, "folder_count": len(c["folders"]), "resume_count": len(c["files"]),
+                       "file_ids": [x["id"] for x in c["files"]]}
         except WorkDriveError as e:
-            return {**f, "folder_count": None, "resume_count": None, "error": str(e)}
+            return False, {**f, "folder_count": None, "resume_count": None, "error": str(e)}
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        subfolders = list(pool.map(count, children["folders"]))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(count, children["folders"]))
+    subfolders = [r for _, r in results]
+    stale = stale or any(s for s, _ in results)
 
     return {
         "folder": path[-1],
@@ -197,6 +279,7 @@ def browse(folder_id: str | None) -> dict:
         "role": path[1] if len(path) > 1 else None,
         "subfolders": subfolders,
         "files": children["files"],
+        "stale": stale,
     }
 
 
@@ -251,6 +334,7 @@ def verify_safe_to_delete(file_id: str, *, expected_folder_id: str, expected_nam
 
 
 def _set_status(file_id: str, status: int) -> requests.Response:
+    invalidate_listings()
     url = f"{config.WORKDRIVE_API_BASE}/files/{file_id}"
     body = {"data": {"attributes": {"status": str(status)}, "type": "files"}}
     try:
@@ -330,6 +414,7 @@ def create_folder(parent_id: str, name: str) -> dict:
                              json=body, timeout=30)
     except requests.exceptions.RequestException as e:
         raise WorkDriveError(f"Could not reach WorkDrive API ({url}): {e}")
+    invalidate_listings()
     if resp.status_code not in (200, 201):
         raise WorkDriveError(_create_error("Could not create the folder", resp))
     try:
@@ -374,6 +459,7 @@ def upload_resume(folder_id: str, filename: str, content: bytes) -> dict:
         )
     except requests.exceptions.RequestException as e:
         raise WorkDriveError(f"Could not reach WorkDrive upload API: {e}")
+    invalidate_listings()
     if resp.status_code not in (200, 201):
         raise WorkDriveError(_create_error(f"Could not upload '{filename}'", resp))
     try:
@@ -401,6 +487,7 @@ def _create_error(prefix: str, resp) -> str:
 def _forget_cached(item_id: str) -> None:
     with _folder_cache_lock:
         _folder_cache.pop(item_id, None)
+    invalidate_listings()
 
 
 def _patch(item_id: str, attributes: dict, action: str) -> dict:
@@ -520,15 +607,15 @@ def walkin_folder(role_folder_id: str) -> str:
 
 def folder_tree() -> list[dict]:
     """Role folders with their subfolders, for the 'Move to' picker."""
-    roles = list_children(config.WORKDRIVE_ROOT_FOLDER_ID)["folders"]
+    roles = list_children(config.WORKDRIVE_ROOT_FOLDER_ID, cached=True)["folders"]
 
     def subs(role):
         try:
-            return {**role, "children": list_children(role["id"])["folders"]}
+            return {**role, "children": list_children(role["id"], cached=True)["folders"]}
         except WorkDriveError:
             return {**role, "children": []}
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=16) as pool:
         tree = list(pool.map(subs, roles))
     tree.sort(key=lambda r: r["name"].lower())
     for r in tree:

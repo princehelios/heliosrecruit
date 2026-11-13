@@ -22,7 +22,19 @@ const state = {
   cand: { filter: "", q: "", recruit: "", role: "", sort: "screened", dir: "desc", page: 1, pageSize: 10 },
   notes: { unseen: -1 },
   list: { folderId: null, q: "", filter: "all", page: 1 },
+  // Last /api/browse answer per folder: revisiting a folder renders at once,
+  // then refreshes in the background.
+  browse: new Map(),
+  roots: { q: "", filter: "all", sort: prefGet("pos-sort", "recent") },
+  act: { data: null, range: prefGet("apps-range", "30"), role: "", day: null, view: "chart" },
 };
+
+function prefGet(key, fallback) {
+  try { return localStorage.getItem(`rs:${key}`) || fallback; } catch { return fallback; }
+}
+function prefSet(key, value) {
+  try { localStorage.setItem(`rs:${key}`, value); } catch { /* storage unavailable */ }
+}
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -97,6 +109,9 @@ function toast(message, kind = "info") {
 }
 
 const I = {
+  refresh: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`,
+  search: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>`,
+  chevron: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>`,
   folder: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`,
   play: `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>`,
   warn: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
@@ -209,11 +224,64 @@ function bindRows(root) {
 
 /* ---------------------------------------------------------------- folders */
 
+const browseKey = folderId => folderId || "root";
+const sameRoute = folderId => {
+  const m = (location.hash || "#/").match(/^#\/folder\/([A-Za-z0-9]+)/);
+  return (m ? m[1] : null) === (folderId || null) && !/^#\/(dashboard|candidates|pending|sheets|log|run)/.test(location.hash);
+};
+// Compare answers without the volatile "stale" flag, so a background refresh
+// only re-renders the page when something actually changed.
+const browseSig = d => JSON.stringify({ ...d, stale: undefined });
+
+function skeletonView(view, folderId) {
+  const cards = Array.from({ length: folderId ? 4 : 8 }, () => `<div class="folder-card skeleton-card" aria-hidden="true">
+      <div class="row"><span class="sk sk-icon"></span><div class="grow"><span class="sk sk-line w70"></span><span class="sk sk-line w40"></span></div></div>
+      <div class="folder-foot"><span class="sk sk-pill"></span><span class="sk sk-pill"></span></div></div>`).join("");
+  view.innerHTML = `<div class="page-head"><div><span class="sk sk-title"></span><span class="sk sk-line w30"></span></div></div>
+    ${folderId ? "" : `<div class="pos-stats">${`<div class="pos-stat skeleton-card"><span class="sk sk-line w40"></span><span class="sk sk-num"></span></div>`.repeat(4)}</div>`}
+    <div class="folder-grid" aria-busy="true" aria-label="Loading">${cards}</div>`;
+}
+
 async function renderFolder(view, folderId, { quiet = false } = {}) {
-  if (!quiet) loading(view);
+  const key = browseKey(folderId);
+  const cached = state.browse.get(key);
+  let shown = null;
+  // A cached answer paints immediately; the network answer replaces it below.
+  if (cached && !quiet) { paintFolder(view, cached); shown = browseSig(cached); }
+  else if (!quiet) skeletonView(view, folderId);
+
   let data;
   try { data = await api(`/api/browse${folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ""}`); }
-  catch (e) { return errorView(view, e.message); }
+  catch (e) { if (!shown) errorView(view, e.message); else toast(e.message, "error"); return; }
+  if (!sameRoute(folderId)) return;  // the user navigated away meanwhile
+  state.browse.set(key, data);
+  if (browseSig(data) !== shown) { paintFolder(view, data); shown = browseSig(data); }
+  setRefreshing(!!data.stale);
+
+  if (data.stale) {
+    // Served from the server's cache while it refreshes: pick up the live numbers.
+    try {
+      const live = await api(`/api/browse?live=1${folderId ? `&folder_id=${encodeURIComponent(folderId)}` : ""}`);
+      if (!sameRoute(folderId)) return;
+      state.browse.set(key, live);
+      if (browseSig(live) !== shown) paintFolder(view, live);
+    } catch { /* keep the cached view */ }
+    setRefreshing(false);
+  }
+}
+
+function setRefreshing(on) {
+  const el = $("#refresh-state");
+  if (!el) return;
+  el.innerHTML = on ? `<span class="spinner"></span> Updating…` : `Up to date`;
+  el.classList.toggle("busy", on);
+}
+
+function paintFolder(view, data) {
+  // Keep what the user was typing when the page re-renders under them.
+  const active = document.activeElement;
+  const focusId = active && view.contains(active) && active.id ? active.id : null;
+  const caret = focusId && typeof active.selectionStart === "number" ? active.selectionStart : null;
 
   if (!state.folder || state.folder.folder.id !== data.folder.id) state.selected.clear();
   if (state.list.folderId !== data.folder.id) state.list = { folderId: data.folder.id, q: "", filter: "all", page: 1 };
@@ -224,6 +292,11 @@ async function renderFolder(view, folderId, { quiet = false } = {}) {
   view.innerHTML = data.depth === 0 ? rootHtml(data) : folderHtml(data);
   bindFolder(view, data);
   if (data.active_run_id) { startPolling(data.active_run_id, data.folder.id); renderSelectBar(); }
+  if (focusId && $(`#${focusId}`, view)) {
+    const el = $(`#${focusId}`, view);
+    el.focus();
+    if (caret != null && el.setSelectionRange) try { el.setSelectionRange(caret, caret); } catch { /* not a text input */ }
+  }
 }
 
 const isPendingFolder = f => (f.name || "").trim().toLowerCase() === (state.status?.form_pending_folder || "Form Pending").toLowerCase();
@@ -259,6 +332,7 @@ function sortFolders(folders, depth) {
 }
 
 function folderCard(f, depth) {
+  if (depth === 0) return positionCard(f);
   const pending = isPendingFolder(f), walkin = isWalkinFolder(f);
   const empty = !f.folder_count && !f.resume_count && !pending && !walkin;
   const meta = walkin ? plural(f.resume_count || 0, "walk-in candidate") : [
@@ -284,16 +358,118 @@ function folderGrid(folders, depth) {
   return `<div class="folder-grid">${sortFolders(folders, depth).map(f => folderCard(f, depth)).join("")}</div>`;
 }
 
+/* ---------------------------------------------------------------- positions (root) page */
+
+const isEmptyPosition = f => !f.folder_count && !f.resume_count;
+
+function positionCard(f) {
+  const empty = isEmptyPosition(f);
+  const meta = [
+    f.folder_count ? plural(f.folder_count, "date folder") : "",
+    f.resume_count || !f.folder_count ? plural(f.resume_count || 0, "resume") : "",
+  ].filter(Boolean).join(" · ");
+  const check = (ok, label) => `<span class="setup-dot ${ok ? "ok" : ""}" title="${label}: ${ok ? "set" : "not set"}">${ok ? "✓" : "–"} ${label}</span>`;
+  const todo = f.unscreened ? `<span class="tag blue todo">${f.unscreened} to screen</span>`
+    : f.waiting ? `<span class="tag warn todo">${f.waiting} waiting for form</span>` : "";
+  return `<a class="folder-card pos-card ${empty ? "is-empty" : ""} ${f.unscreened ? "has-todo" : ""}" href="#/folder/${esc(f.id)}"
+      data-id="${esc(f.id)}" title="${esc(f.name)}">
+    <div class="row"><span class="folder-icon">${I.folder}</span>
+      <div class="grow"><div class="folder-name clamp-2">${esc(f.name)}</div>
+      <div class="folder-meta">${f.error ? `<span class="muted">Couldn't count resumes</span>` : meta}</div></div>
+      <span class="pos-go" aria-hidden="true">${I.chevron}</span></div>
+    <div class="folder-foot">${check(f.has_jd, "JD")}${check(f.has_sheet, "Form sheet")}<span class="spacer"></span>${todo}</div>
+  </a>`;
+}
+
+const POS_FILTERS = [
+  ["all", "All", () => true],
+  ["todo", "To screen", f => f.unscreened > 0],
+  ["nojd", "Missing JD", f => !f.has_jd],
+  ["nosheet", "Missing form sheet", f => !f.has_sheet],
+];
+const POS_SORTS = [["recent", "Recent activity"], ["todo", "Most to screen"], ["name", "Name (A–Z)"]];
+
+function sortPositions(list) {
+  const by = state.roots.sort;
+  return [...list].sort((a, b) => {
+    // Empty positions always sink to the bottom.
+    if (isEmptyPosition(a) !== isEmptyPosition(b)) return isEmptyPosition(a) ? 1 : -1;
+    if (by === "name") return a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true });
+    if (by === "todo" && (b.unscreened || 0) !== (a.unscreened || 0)) return (b.unscreened || 0) - (a.unscreened || 0);
+    return lastActivity(b) - lastActivity(a);
+  });
+}
+
+function rootStatsHtml(subs) {
+  const toScreen = subs.reduce((n, f) => n + (f.unscreened || 0), 0);
+  const withTodo = subs.filter(f => f.unscreened > 0).length;
+  const noJd = subs.filter(f => !f.has_jd).length;
+  const noSheet = subs.filter(f => !f.has_sheet).length;
+  const stat = (filter, label, value, note, cls = "") => `<button class="pos-stat ${cls} ${state.roots.filter === filter ? "active" : ""}" data-filter="${filter}">
+      <span class="label">${label}</span><span class="value">${value.toLocaleString()}</span><span class="note">${note}</span></button>`;
+  return `<div class="pos-stats" role="group" aria-label="Filter positions">
+    ${stat("all", "Positions", subs.length, `${subs.filter(f => !isEmptyPosition(f)).length} with resumes`)}
+    ${stat("todo", "Resumes to screen", toScreen, withTodo ? `across ${plural(withTodo, "position")}` : "All caught up", toScreen ? "info" : "")}
+    ${stat("nojd", "Missing job description", noJd, noJd ? "Can't be screened yet" : "All set", noJd ? "warn" : "")}
+    ${stat("nosheet", "Missing form sheet", noSheet, noSheet ? "Scored on resume alone" : "All linked")}
+  </div>`;
+}
+
 function rootHtml(data) {
-  return `<div class="page-head"><div><h1>Positions</h1><div class="sub">Most recently active first.</div></div>
+  const subs = data.subfolders;
+  return `<div class="page-head"><div><h1>Positions</h1>
+        <div class="sub"><span id="refresh-state" class="refresh-state">Up to date</span></div></div>
       <div class="head-actions">
-        ${data.subfolders.length > 6 ? `<input type="search" id="pos-q" placeholder="Search positions" aria-label="Search positions">` : ""}
         <button class="btn" id="add-walkin">+ Add walk-in</button>
         <button class="btn" id="fetch-emails">Fetch from email</button>
         <button class="btn primary" id="new-folder" data-label="position">+ New position</button>
       </div></div>
-    ${data.subfolders.length ? folderGrid(data.subfolders, 0) + `<div class="empty hidden" id="pos-none">No positions match.</div>`
+    ${subs.length ? `${rootStatsHtml(subs)}
+      <div class="pos-toolbar">
+        <label class="search-box">${I.search}<input type="search" id="pos-q" placeholder="Search positions" aria-label="Search positions" value="${esc(state.roots.q)}"></label>
+        <span class="spacer"></span>
+        <label class="sort-box">Sort <select id="pos-sort" aria-label="Sort positions">
+          ${POS_SORTS.map(([v, l]) => `<option value="${v}" ${state.roots.sort === v ? "selected" : ""}>${l}</option>`).join("")}
+        </select></label>
+        <button class="btn ghost icon-btn" id="pos-refresh" title="Reload from WorkDrive" aria-label="Reload from WorkDrive">${I.refresh}</button>
+      </div>
+      <div class="folder-grid" id="pos-grid"></div>
+      <div class="card hidden" id="pos-none"><div class="empty"><strong>No positions match</strong><span id="pos-none-why"></span></div></div>`
       : `<div class="card"><div class="empty">${I.inbox}<strong>No positions yet</strong>Click + New position, or create folders like "Full Stack" in the WorkDrive resumes folder.</div></div>`}`;
+}
+
+function renderPositions(view, data) {
+  const grid = $("#pos-grid", view);
+  if (!grid) return;
+  const q = state.roots.q.toLowerCase();
+  const test = (POS_FILTERS.find(([k]) => k === state.roots.filter) || POS_FILTERS[0])[2];
+  const list = sortPositions(data.subfolders.filter(f => test(f) && (!q || f.name.toLowerCase().includes(q))));
+  grid.innerHTML = list.map(positionCard).join("");
+  $("#pos-none", view).classList.toggle("hidden", list.length > 0);
+  $("#pos-none-why", view).textContent = q ? `Nothing matches "${state.roots.q}".` : "No position fits this filter.";
+  $$(".pos-stat", view).forEach(b => b.classList.toggle("active", b.dataset.filter === state.roots.filter));
+}
+
+function bindPositions(view, data) {
+  renderPositions(view, data);
+  $$(".pos-stat", view).forEach(b => b.addEventListener("click", () => {
+    state.roots.filter = state.roots.filter === b.dataset.filter ? "all" : b.dataset.filter;
+    renderPositions(view, data);
+  }));
+  $("#pos-q", view)?.addEventListener("input", e => { state.roots.q = e.target.value.trim(); renderPositions(view, data); });
+  $("#pos-sort", view)?.addEventListener("change", e => {
+    state.roots.sort = e.target.value; prefSet("pos-sort", e.target.value); renderPositions(view, data);
+  });
+  $("#pos-refresh", view)?.addEventListener("click", async e => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.classList.add("spinning"); setRefreshing(true);
+    try {
+      const live = await api("/api/browse?live=1");
+      state.browse.set("root", live);
+      if (sameRoute(null)) paintFolder(view, live);
+    } catch (err) { toast(err.message, "error"); }
+    finally { btn.disabled = false; btn.classList.remove("spinning"); setRefreshing(false); }
+  });
 }
 
 function folderHtml(data) {
@@ -623,15 +799,7 @@ function bindFolder(view, data) {
   bindFolderMenu(data);
   $("#add-walkin")?.addEventListener("click", () => walkinDialog(data.role?.id));
 
-  if (data.depth === 0) {
-    $("#pos-q")?.addEventListener("input", e => {
-      const q = e.target.value.trim().toLowerCase();
-      let shown = 0;
-      $$(".folder-card", view).forEach(c => { const hit = !q || c.dataset.name.includes(q); c.hidden = !hit; shown += hit; });
-      $("#pos-none")?.classList.toggle("hidden", shown > 0);
-    });
-    return;
-  }
+  if (data.depth === 0) return bindPositions(view, data);
 
   $("#jd-open").addEventListener("click", () => jdDialog(data));
   $("#sheet-open")?.addEventListener("click", () => sheetDialog(data));
@@ -1223,6 +1391,7 @@ async function renderDashboard(view) {
     <div class="page-head"><div><h1>Dashboard</h1>
       <div class="sub">Every resume the screener has parsed, counted once per file.</div></div></div>
     <div class="stack">
+      ${appsCardShell()}
       <div class="tiles">
         ${tile("Resumes parsed", t.screened, "across all positions")}
         ${tile("High", t.band_high, pct(t.band_high, t.screened), "good")}
@@ -1275,7 +1444,277 @@ async function renderDashboard(view) {
       </section>
     </div>`;
   bindRows(view);
+  loadActivity();
 }
+
+/* ---------------------------------------------------------------- applications by date (dashboard) */
+
+const ACT_RANGES = [["7", "7 days"], ["30", "30 days"], ["90", "90 days"], ["all", "All time"]];
+const ACT_SERIES = [
+  { key: "resumes", label: "Resumes received", color: "var(--series-1)" },
+  { key: "responses", label: "Form responses", color: "var(--series-2)" },
+];
+
+const isoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const parseDay = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const shortDay = s => parseDay(s).toLocaleDateString([], { day: "numeric", month: "short" });
+const longDay = s => parseDay(s).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+function appsCardShell() {
+  return `<section class="card apps-card" id="apps-card" aria-busy="true">
+    <div class="card-head"><div><h2>Applications by date</h2>
+      <div class="hint">Resumes received and Google Form responses per day.</div></div></div>
+    <div class="card-body"><div class="apps-stats">${`<div class="apps-stat"><span class="sk sk-line w40"></span><span class="sk sk-num"></span></div>`.repeat(4)}</div>
+      <div class="sk" style="height:220px;margin-top:18px"></div></div>
+  </section>`;
+}
+
+async function loadActivity() {
+  const card = $("#apps-card");
+  if (!card) return;
+  try { state.act.data = await api("/api/activity"); }
+  catch (e) {
+    card.removeAttribute("aria-busy");
+    card.querySelector(".card-body").innerHTML = `<div class="empty">${I.warn}<strong>Couldn't load applications</strong>${esc(e.message)}</div>`;
+    return;
+  }
+  if (!$("#apps-card")) return;  // left the dashboard meanwhile
+  renderActivity();
+}
+
+/* Daily totals for the chosen range and position, zero-filled so quiet days still show. */
+function activitySeries() {
+  const d = state.act.data, role = state.act.role;
+  const rows = d.rows.filter(r => !role || r.role_id === role);
+  const byDay = new Map();
+  for (const r of rows) {
+    const b = byDay.get(r.date) || { date: r.date, resumes: 0, responses: 0, email: 0, walkin: 0, upload: 0 };
+    for (const k of ["resumes", "responses", "email", "walkin", "upload"]) b[k] += r[k];
+    byDay.set(r.date, b);
+  }
+  const today = parseDay(d.today);
+  let start;
+  if (state.act.range === "all") {
+    const first = [...byDay.keys()].sort()[0];
+    start = first ? parseDay(first) : new Date(today);
+  } else {
+    start = new Date(today); start.setDate(start.getDate() - Number(state.act.range) + 1);
+  }
+  const days = [];
+  for (const t = new Date(start); t <= today; t.setDate(t.getDate() + 1)) {
+    const k = isoDay(t);
+    days.push(byDay.get(k) || { date: k, resumes: 0, responses: 0, email: 0, walkin: 0, upload: 0 });
+  }
+  return { days, byDay, rows };
+}
+
+function renderActivity() {
+  const card = $("#apps-card");
+  const d = state.act.data;
+  if (!card || !d) return;
+  card.removeAttribute("aria-busy");
+  const { days, byDay, rows } = activitySeries();
+  const sum = k => days.reduce((n, x) => n + x[k], 0);
+  const busiest = days.reduce((best, x) => (x.resumes + x.responses > (best ? best.resumes + best.responses : 0) ? x : best), null);
+  const todayRow = byDay.get(d.today) || { resumes: 0, responses: 0 };
+  // Default day: today if anything came in, else the latest day with activity.
+  if (!state.act.day || !(state.act.day <= d.today)) {
+    const active = [...byDay.keys()].sort();
+    state.act.day = byDay.has(d.today) ? d.today : active[active.length - 1] || d.today;
+  }
+  const rangeLabel = state.act.range === "all" ? "all time" : `last ${state.act.range} days`;
+  const stat = (label, value, note) => `<div class="apps-stat"><div class="label">${label}</div>
+    <div class="value">${value}</div><div class="note">${note}</div></div>`;
+  const warnings = [
+    ...d.sheet_errors.map(e => `Form responses for <b>${esc(e.role_name)}</b> are missing: ${esc(e.error)}`),
+    ...(d.folder_errors.length ? [`${plural(d.folder_errors.length, "folder")} couldn't be read from WorkDrive, so some resumes may be missing.`] : []),
+  ];
+
+  card.querySelector(".card-head").innerHTML = `<div><h2>Applications by date</h2>
+      <div class="hint">Resumes received and Google Form responses per day.</div></div>
+    <div class="apps-filters">
+      <div class="segmented" role="group" aria-label="Date range">${ACT_RANGES.map(([v, l]) =>
+        `<button class="${state.act.range === v ? "on" : ""}" data-range="${v}" aria-pressed="${state.act.range === v}">${l}</button>`).join("")}</div>
+      <select id="apps-role" aria-label="Position"><option value="">All positions</option>
+        ${d.roles.map(r => `<option value="${esc(r.id)}" ${state.act.role === r.id ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select>
+      <label class="apps-date">On date <input type="date" id="apps-day" value="${esc(state.act.day)}" max="${esc(d.today)}"></label>
+    </div>`;
+
+  card.querySelector(".card-body").innerHTML = `
+    <div class="apps-stats">
+      ${stat("Resumes received", sum("resumes").toLocaleString(), rangeLabel)}
+      ${stat("Form responses", sum("responses").toLocaleString(), rangeLabel)}
+      ${stat("Busiest day", busiest ? shortDay(busiest.date) : "—",
+        busiest ? `${plural(busiest.resumes, "resume")} · ${plural(busiest.responses, "response")}` : "nothing in this range")}
+      ${stat("Today", `${todayRow.resumes} <span class="value-sep">/</span> ${todayRow.responses}`, "resumes / form responses")}
+    </div>
+    ${warnings.length ? `<div class="callout apps-warn">${I.warn}<div>${warnings.join("<br>")}</div></div>` : ""}
+    <div class="apps-toolbar">
+      <div class="apps-legend">${ACT_SERIES.map(s => `<span><i style="background:${s.color}"></i>${s.label}</span>`).join("")}</div>
+      <div class="segmented small" role="group" aria-label="View">
+        <button class="${state.act.view === "chart" ? "on" : ""}" data-view="chart">Chart</button>
+        <button class="${state.act.view === "table" ? "on" : ""}" data-view="table">Table</button></div>
+    </div>
+    <div id="apps-plot" class="apps-plot"></div>
+    <div id="apps-day-detail"></div>
+    <p class="apps-foot muted small">A resume counts on the date of its date folder (e.g. "13 Nov"); resumes outside date folders count on
+      the day they were uploaded. Resumes already sent to Zoho Recruit and removed from WorkDrive are still counted.
+      Form responses use the sheet's Timestamp column.</p>`;
+
+  $$("[data-range]", card).forEach(b => b.addEventListener("click", () => { state.act.range = b.dataset.range; prefSet("apps-range", b.dataset.range); renderActivity(); }));
+  $$("[data-view]", card).forEach(b => b.addEventListener("click", () => { state.act.view = b.dataset.view; renderActivity(); }));
+  $("#apps-role", card).addEventListener("change", e => { state.act.role = e.target.value; renderActivity(); });
+  $("#apps-day", card).addEventListener("change", e => {
+    if (!e.target.value) return;
+    state.act.day = e.target.value;
+    // Jumping to a day outside the range widens the range so the day is on the chart.
+    const { days: shown } = activitySeries();
+    if (shown.length && state.act.day < shown[0].date) state.act.range = "all";
+    renderActivity();
+  });
+
+  if (state.act.view === "table") renderActivityTable(days);
+  else renderActivityChart(days);
+  renderDayDetail(rows);
+}
+
+function selectActivityDay(day) {
+  state.act.day = day;
+  const input = $("#apps-day");
+  if (input) input.value = day;
+  $$("#apps-plot .apps-band").forEach(b => b.classList.toggle("selected", b.dataset.day === day));
+  $$("#apps-plot tr[data-day]").forEach(r => r.classList.toggle("selected", r.dataset.day === day));
+  renderDayDetail(activitySeries().rows);
+}
+
+function niceMax(v) {
+  if (v <= 4) return 4;
+  const p = 10 ** Math.floor(Math.log10(v)), n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+}
+
+/* Bar with 4px rounded top corners, square at the baseline. */
+function topRounded(x, y, w, h) {
+  const r = Math.min(4, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+
+function renderActivityChart(days) {
+  const host = $("#apps-plot");
+  const W = Math.max(300, host.clientWidth), H = 230;
+  const m = { top: 14, right: 8, bottom: 28, left: 40 };
+  const iw = W - m.left - m.right, ih = H - m.top - m.bottom;
+  const n = days.length, band = iw / n;
+  const max = niceMax(Math.max(1, ...days.map(x => Math.max(x.resumes, x.responses))));
+  const y = v => m.top + ih - (v / max) * ih;
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => Math.round(max * f));
+  // Two bars per day with a 2px gap between them and at least 2px between days.
+  const bw = Math.max(1, Math.min(16, (band - 2 - 2) / 2));
+  const labelEvery = Math.max(1, Math.ceil(52 / band));
+
+  let svg = `<svg class="apps-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Resumes received and form responses per day">`;
+  svg += ticks.map(t => `<line class="grid" x1="${m.left}" x2="${W - m.right}" y1="${y(t)}" y2="${y(t)}"/>
+    <text class="axis" x="${m.left - 8}" y="${y(t) + 4}" text-anchor="end">${t.toLocaleString()}</text>`).join("");
+  days.forEach((dd, i) => {
+    const x0 = m.left + i * band, cx = x0 + band / 2;
+    svg += `<g class="apps-band ${dd.date === state.act.day ? "selected" : ""}" data-i="${i}" data-day="${dd.date}" tabindex="0"
+        aria-label="${esc(shortDay(dd.date))}: ${dd.resumes} resumes, ${dd.responses} form responses">
+      <rect class="hit" x="${x0}" y="${m.top}" width="${band}" height="${ih}"/>`;
+    ACT_SERIES.forEach((s, j) => {
+      const v = dd[s.key];
+      if (!v) return;
+      const bx = cx - bw - 1 + j * (bw + 2);
+      svg += `<path class="bar" d="${topRounded(bx, y(v), bw, y(0) - y(v))}" style="fill:${s.color}"/>`;
+    });
+    svg += `</g>`;
+    if ((n - 1 - i) % labelEvery === 0) svg += `<text class="axis" x="${cx}" y="${H - 8}" text-anchor="middle">${esc(shortDay(dd.date))}</text>`;
+  });
+  svg += `<line class="baseline" x1="${m.left}" x2="${W - m.right}" y1="${y(0)}" y2="${y(0)}"/>`;
+  // Direct label on each series' peak day, so the headline numbers read without hovering.
+  ACT_SERIES.forEach((s, j) => {
+    const peak = days.reduce((b, x, i) => (x[s.key] > (b ? days[b.i][s.key] : 0) ? { i } : b), null);
+    if (!peak) return;
+    const cx = m.left + peak.i * band + band / 2, bx = cx - bw - 1 + j * (bw + 2) + bw / 2;
+    svg += `<text class="peak" x="${Math.min(W - m.right - 12, Math.max(m.left + 12, bx))}" y="${y(days[peak.i][s.key]) - 5}" text-anchor="middle">${days[peak.i][s.key]}</text>`;
+  });
+  svg += `</svg>`;
+  host.innerHTML = svg + `<div class="apps-tip" id="apps-tip" hidden></div>`;
+
+  const tip = $("#apps-tip");
+  const show = g => {
+    const dd = days[Number(g.dataset.i)];
+    tip.replaceChildren();
+    const head = document.createElement("div"); head.className = "tip-head"; head.textContent = longDay(dd.date); tip.append(head);
+    ACT_SERIES.forEach(s => {
+      const row = document.createElement("div"); row.className = "tip-row";
+      const key = document.createElement("i"); key.style.background = s.color;
+      const val = document.createElement("b"); val.textContent = dd[s.key].toLocaleString();
+      const lab = document.createElement("span"); lab.textContent = s.label;
+      row.append(key, val, lab); tip.append(row);
+    });
+    if (dd.resumes) {
+      const src = document.createElement("div"); src.className = "tip-src";
+      src.textContent = [["email", "by email"], ["walkin", "walk-in"], ["upload", "uploaded"]]
+        .filter(([k]) => dd[k]).map(([k, l]) => `${dd[k]} ${l}`).join(" · ");
+      tip.append(src);
+    }
+    tip.hidden = false;
+    const box = host.getBoundingClientRect(), r = g.getBoundingClientRect();
+    const left = r.left - box.left + r.width / 2 - tip.offsetWidth / 2;
+    tip.style.left = `${Math.max(0, Math.min(box.width - tip.offsetWidth, left))}px`;
+    tip.style.top = `${Math.max(0, m.top - 4)}px`;
+  };
+  $$(".apps-band", host).forEach(g => {
+    g.addEventListener("pointerenter", () => show(g));
+    g.addEventListener("focus", () => show(g));
+    g.addEventListener("pointerleave", () => { tip.hidden = true; });
+    g.addEventListener("blur", () => { tip.hidden = true; });
+    g.addEventListener("click", () => selectActivityDay(g.dataset.day));
+    g.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectActivityDay(g.dataset.day); } });
+  });
+}
+
+function renderActivityTable(days) {
+  const host = $("#apps-plot");
+  const list = [...days].reverse().filter(x => x.resumes || x.responses);
+  host.innerHTML = list.length ? `<div class="table-wrap apps-table"><table>
+      <thead><tr><th>Date</th><th class="num">Resumes</th><th class="num">By email</th><th class="num">Walk-in</th>
+        <th class="num">Uploaded</th><th class="num">Form responses</th></tr></thead>
+      <tbody>${list.map(x => `<tr class="clickable ${x.date === state.act.day ? "selected" : ""}" data-day="${x.date}">
+        <td class="nowrap"><b>${esc(shortDay(x.date))}</b> <span class="muted small">${esc(parseDay(x.date).toLocaleDateString([], { weekday: "short" }))}</span></td>
+        <td class="num">${x.resumes}</td><td class="num">${x.email || ""}</td><td class="num">${x.walkin || ""}</td>
+        <td class="num">${x.upload || ""}</td><td class="num">${x.responses}</td></tr>`).join("")}</tbody></table></div>`
+    : `<div class="empty">Nothing received in this range.</div>`;
+  $$("tr[data-day]", host).forEach(r => r.addEventListener("click", () => selectActivityDay(r.dataset.day)));
+}
+
+function renderDayDetail(rows) {
+  const host = $("#apps-day-detail");
+  if (!host) return;
+  const day = state.act.day;
+  const names = new Map(state.act.data.roles.map(r => [r.id, r.name]));
+  const list = rows.filter(r => r.date === day).sort((a, b) => (b.resumes + b.responses) - (a.resumes + a.responses));
+  const tot = k => list.reduce((n, r) => n + r[k], 0);
+  host.innerHTML = `<div class="apps-day">
+    <div class="apps-day-head"><h3>${esc(longDay(day))}</h3>
+      <span class="muted">${plural(tot("resumes"), "resume")} received · ${plural(tot("responses"), "form response")}</span></div>
+    ${list.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Position</th><th class="num">Resumes</th><th class="num">By email</th><th class="num">Walk-in</th>
+        <th class="num">Uploaded</th><th class="num">Form responses</th></tr></thead>
+      <tbody>${list.map(r => `<tr class="clickable" data-href="#/folder/${esc(r.role_id)}">
+        <td><b>${esc(names.get(r.role_id) || "(deleted position)")}</b></td>
+        <td class="num">${r.resumes}</td><td class="num">${r.email || ""}</td><td class="num">${r.walkin || ""}</td>
+        <td class="num">${r.upload || ""}</td><td class="num">${r.responses}</td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="empty small">No resumes or form responses on this day${state.act.role ? " for this position" : ""}.</div>`}
+  </div>`;
+  bindRows(host);
+}
+
+let actResizeTimer;
+window.addEventListener("resize", () => {
+  clearTimeout(actResizeTimer);
+  actResizeTimer = setTimeout(() => { if ($("#apps-card") && state.act.data && state.act.view === "chart") renderActivity(); }, 150);
+});
 
 function runStatusTag(r) {
   if (r.status === "running") return `<span class="tag blue">Running</span>`;
@@ -1727,6 +2166,19 @@ document.addEventListener("keydown", e => { if (e.key === "Escape") { closeMenus
 $$("#drawer .drawer-scrim").forEach(el => el.addEventListener("click", closeDrawer));
 $$("#modal .modal-scrim").forEach(el => el.addEventListener("click", closeModal));
 window.addEventListener("hashchange", route);
+
+const prefetching = new Set();
+document.addEventListener("pointerover", e => {
+  const card = e.target.closest?.("a.folder-card[href^='#/folder/']");
+  if (!card) return;
+  const id = card.getAttribute("href").slice("#/folder/".length);
+  if (state.browse.has(id) || prefetching.has(id)) return;
+  prefetching.add(id);
+  api(`/api/browse?folder_id=${encodeURIComponent(id)}`)
+    .then(d => { if (!state.browse.has(id)) state.browse.set(id, d); })
+    .catch(() => {})
+    .finally(() => prefetching.delete(id));
+});
 
 loadStatus().then(() => { if (state.folder && $("#resume-rows")) renderResumeRows(); });
 route();

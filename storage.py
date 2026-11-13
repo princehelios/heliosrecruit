@@ -196,6 +196,7 @@ _MIGRATIONS = {
         "recruit_action": "TEXT",                   # insert = new candidate | update = existing one
         "duration_ms": "INTEGER",                   # wall time for this resume, download -> done
         "form_json": "TEXT",                        # matched Google Form response (answers)
+        "file_added_ms": "INTEGER",                 # when the resume landed in WorkDrive (applications chart)
     },
 }
 
@@ -362,13 +363,13 @@ def mark_interrupted_runs() -> int:
 
 # ---------------------------------------------------------------- screenings
 
-def create_screening(run_id, file_id, filename, folder_id) -> int:
+def create_screening(run_id, file_id, filename, folder_id, file_added_ms=None) -> int:
     with _conn() as c:
         ts = now()
         cur = c.execute(
-            """INSERT INTO screenings (run_id, file_id, filename, folder_id, stage, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'queued', ?, ?)""",
-            (run_id, file_id, filename, folder_id, ts, ts),
+            """INSERT INTO screenings (run_id, file_id, filename, folder_id, stage, created_at, updated_at, file_added_ms)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+            (run_id, file_id, filename, folder_id, ts, ts, file_added_ms),
         )
         return cur.lastrowid
 
