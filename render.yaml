@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: resume-screener
+    runtime: python
+    # Free plan: spins down after 15 min idle. keepalive.py (in-process) plus
+    # .github/workflows/keepalive.yml (external) ping /healthz every 10 min so a
+    # visitor never waits on a cold start.
+    #
+    # Free-plan limits to know about:
+    #   * 512 MB RAM - email fetch (Chromium) and screening must not overlap;
+    #     the app already blocks that.
+    #   * 750 instance-hours/month across ALL your free web services. Keeping
+    #     this one awake 24/7 uses ~730, so it must be your only free service
+    #     or Render will suspend it near month end.
+    #   * NO persistent disk. screener.db is wiped on every deploy and restart,
+    #     taking job descriptions, sheet links and history with it. The Form
+    #     Pending list rebuilds itself from WorkDrive; JDs and sheet links do
+    #     not. Upgrade to Starter + a disk at /var/data to keep them.
+    plan: free
+    # Chromium is downloaded INTO the project folder (PLAYWRIGHT_BROWSERS_PATH=0) so it
+    # is still there at runtime; the Indeed resume download runs in it, headless.
+    buildCommand: pip install -r requirements.txt && playwright install chromium
+    # ONE worker: screening runs and the email fetch keep their progress in memory
+    # and run in background threads, so every request must hit the same process.
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT
+    # /healthz answers instantly without touching the DB or Zoho, so a busy
+    # screening run can't fail the health check and get the service restarted.
+    # It is also what both keep-alive pingers hit.
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
+      - key: FETCH_TABS
+        value: "1"   # one Chrome tab: more than one OOMs a 512 MB free instance
+      - key: UPLOAD_WORKERS
+        value: "2"   # parallel WorkDrive uploads during an email fetch
+      - key: MAX_PARALLEL_RESUMES
+        value: "3"   # resumes scored at once; lower to 2 if the instance OOMs
+      - key: KEEPALIVE_MINUTES
+        value: "10"  # ping interval; must stay under Render's 15 min idle cut-off
+      # KEEPALIVE_URL is not needed - Render injects RENDER_EXTERNAL_URL and
+      # keepalive.py uses that automatically. Set KEEPALIVE_ENABLED=false to stop.
+      - key: ZOHO_DOMAIN
+        value: com
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: WORKDRIVE_ROOT_FOLDER_ID
+        sync: false
+      - key: EMAIL_ADDRESS
+        value: helios.cvtechlabs@gmail.com
+      - key: EMAIL_APP_PASSWORD
+        sync: false
+      - key: FORM_CHECK_MINUTES
+        value: "10"  # how often Google Form response sheets are re-checked
+      # On Starter + a persistent disk mounted at /var/data, uncomment so the
+      # history (JDs, sheet links, screenings) survives redeploys:
+      # - key: DATABASE_PATH
+      #   value: /var/data/screener.db
