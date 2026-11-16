@@ -430,12 +430,14 @@ def _role_folder(role_folder_id: str) -> dict:
 @app.get("/api/roles")
 def api_roles():
     """Every position folder with its JD / sheet link, for the Form sheets page."""
+    forms = {f["id"]: f for f in storage.list_forms()}   # also adopts links saved before the Forms page
     jds = storage.list_jds()
     roles = []
     for f in zoho_workdrive.list_children(config.WORKDRIVE_ROOT_FOLDER_ID, cached=True)["folders"]:
         jd = jds.get(f["id"]) or {}
+        form = forms.get(jd.get("form_id")) or {}
         roles.append({"id": f["id"], "name": f["name"], "has_jd": bool((jd.get("jd_text") or "").strip()),
-                      "modified": f.get("modified"),
+                      "modified": f.get("modified"), "form_id": form.get("id"), "form_name": form.get("name") or "",
                       "form_sheet_url": jd.get("form_sheet_url") or "", "form_url": jd.get("form_url") or "",
                       "custom_template": bool(jd.get("invite_subject") or jd.get("invite_body"))})
     roles.sort(key=lambda r: r["name"].lower())
@@ -468,6 +470,110 @@ def api_role_sheet(role_folder_id):
                         **google_sheets.describe(google_sheets.load(url))})
     except SheetError as e:
         return jsonify({"linked": True, "ok": False, "form_sheet_url": url, "error": str(e)})
+
+
+# ---------------------------------------------------------------- shared Google Forms
+
+def _positions_by_id() -> dict:
+    return {f["id"]: f for f in zoho_workdrive.list_children(config.WORKDRIVE_ROOT_FOLDER_ID, cached=True)["folders"]}
+
+
+@app.get("/api/forms")
+def api_forms():
+    """Every Google Form with the positions using it, plus every position
+    (so the page can assign them)."""
+    forms = storage.list_forms()
+    jds = storage.list_jds()
+    positions = sorted(({"id": f["id"], "name": f["name"], "form_id": (jds.get(f["id"]) or {}).get("form_id")}
+                        for f in _positions_by_id().values()), key=lambda p: p["name"].lower())
+    live = {p["id"] for p in positions}
+    for f in forms:   # positions whose folder was deleted outside the app aren't shown
+        f["positions"] = [p for p in f["positions"] if p["id"] in live]
+    return jsonify({"forms": forms, "positions": positions})
+
+
+def _form_body() -> tuple[str, str, str, dict | None, list | None]:
+    body = request.get_json(force=True, silent=True) or {}
+    name = " ".join((body.get("name") or "").split())[:120]
+    if not name:
+        raise pipeline.PipelineError("Give the form a name, e.g. \"Sales form\".")
+    form_url = (body.get("form_url") or "").strip()
+    if form_url and not _FORM_URL_RE.match(form_url):
+        raise pipeline.PipelineError("That doesn't look like a Google Form link. Open the form, click Send → the "
+                                     "link icon, and copy the link (it starts with https://docs.google.com/forms/ "
+                                     "or https://forms.gle/).")
+    sheet_url, info = _checked_sheet_url(body.get("sheet_url"))
+    ids = body.get("position_ids")
+    return name, form_url, sheet_url, info, (list(ids) if isinstance(ids, list) else None)
+
+
+def _assign_positions(form_id: int, wanted: list) -> list:
+    """Makes exactly `wanted` use this form. Returns every position id touched."""
+    folders = _positions_by_id()
+    unknown = [i for i in wanted if i not in folders]
+    if unknown:
+        raise pipeline.PipelineError("Some of the chosen positions no longer exist in WorkDrive. Reload the page.")
+    current = set(storage.form_position_ids(form_id))
+    touched = []
+    for rid in set(wanted) - current:
+        storage.assign_form(rid, folders[rid]["name"], form_id)
+        touched.append(rid)
+    for rid in current - set(wanted):
+        if rid in folders:
+            storage.assign_form(rid, folders[rid]["name"], None)
+            touched.append(rid)
+    return touched
+
+
+def _save_form(form_id: int | None):
+    name, form_url, sheet_url, info, ids = _form_body()
+    form, changed = storage.save_form(form_id, name, form_url, sheet_url)
+    touched = _assign_positions(form["id"], ids) if ids is not None else []
+    for rid in set(changed) | set(touched):
+        role_settings.backup(rid)
+    n = len(storage.form_position_ids(form["id"]))
+    storage.log("info", f"Google Form '{name}' {'saved' if form_id else 'added'} - used by {n} position(s)"
+                        + ("" if sheet_url else ", no response sheet yet") + ".")
+    return jsonify({**form, "sheet": info})
+
+
+@app.post("/api/forms")
+def api_add_form():
+    return _save_form(None)
+
+
+@app.put("/api/forms/<int:form_id>")
+def api_update_form(form_id):
+    if not storage.get_form(form_id):
+        return _error("That form no longer exists.", 404)
+    return _save_form(form_id)
+
+
+@app.delete("/api/forms/<int:form_id>")
+def api_delete_form(form_id):
+    form = storage.get_form(form_id)
+    if not form:
+        return _error("That form no longer exists.", 404)
+    ids = storage.delete_form(form_id)
+    for rid in ids:
+        role_settings.backup(rid)
+    storage.log("info", f"Google Form '{form['name']}' removed; {len(ids)} position(s) now have no form.")
+    return jsonify({"deleted": True, "positions": len(ids)})
+
+
+@app.put("/api/roles/<role_folder_id>/form")
+def api_assign_form(role_folder_id):
+    """Picks the position's form from the Positions page."""
+    body = request.get_json(force=True, silent=True) or {}
+    role = _role_folder(role_folder_id)
+    form_id = body.get("form_id") or None
+    form = storage.get_form(int(form_id)) if form_id else None
+    if form_id and not form:
+        return _error("That form no longer exists. Reload the page.", 404)
+    storage.assign_form(role_folder_id, role["name"], form["id"] if form else None)
+    role_settings.backup(role_folder_id)
+    storage.log("info", f"'{role['name']}' now uses " + (f"the Google Form '{form['name']}'." if form else "no Google Form."))
+    return jsonify({"form_id": form["id"] if form else None})
 
 
 # ---------------------------------------------------------------- runs
@@ -670,9 +776,15 @@ def api_delete_folder(folder_id):
     for sub in zoho_workdrive.list_children(folder_id)["folders"]:
         _busy_folder(sub["id"])
     out = zoho_workdrive.trash_item(folder_id)
+    position = len(parent_path) == 1          # directly inside ROOT
+    role_id = folder_id if position else parent_path[1]["id"]
+    removed = storage.forget_folder(folder_id, position=position, role_folder_id=role_id,
+                                    walkin_folder=meta["name"].strip().lower() == config.WALKIN_FOLDER.lower())
+    zoho_workdrive.invalidate_listings()
     storage.log("delete", f"Folder '{' / '.join(p['name'] for p in parent_path[1:] + [meta])}' moved to "
-                          "WorkDrive trash from the app.")
-    return jsonify({**out, "parent_id": meta["parent_id"]})
+                          "WorkDrive trash from the app"
+                          + (f"; {removed} applicant(s) in it removed from the app." if removed else "."))
+    return jsonify({**out, "parent_id": meta["parent_id"], "removed": removed, "position": position})
 
 
 # ---------------------------------------------------------------- walk-ins
@@ -742,6 +854,9 @@ def api_applicants():
     role = request.args.get("role") or ""
     if role:
         rows = [a for a in rows if a["role_id"] == role]
+    source = request.args.get("source") or ""
+    if source:
+        rows = [a for a in rows if a["source"] == source]
     rows = applicants.in_range(rows, request.args.get("range") or "all")
     q = (request.args.get("q") or "").strip().lower()
     if q:
@@ -904,7 +1019,8 @@ _FORM_URL_RE = re.compile(r"^https://(docs\.google\.com/forms/|forms\.gle/)\S+$"
 @app.get("/api/roles/<role_folder_id>/invite")
 def api_get_invite_settings(role_folder_id):
     jd = storage.get_jd(role_folder_id) or {}
-    return jsonify({"form_url": jd.get("form_url") or "",
+    form = storage.get_form(jd["form_id"]) if jd.get("form_id") else None
+    return jsonify({"form_url": jd.get("form_url") or "", "form_name": (form or {}).get("name") or "",
                     "invite_subject": jd.get("invite_subject") or "", "invite_body": jd.get("invite_body") or "",
                     "default_subject": config.DEFAULT_INVITE_SUBJECT, "default_body": config.DEFAULT_INVITE_BODY,
                     "from": mailer.sender_label()})
@@ -915,7 +1031,8 @@ def api_save_invite_settings(role_folder_id):
     body = request.get_json(force=True, silent=True) or {}
     role = _role_folder(role_folder_id)
     jd = storage.get_jd(role_folder_id) or {}
-    form_url = (body.get("form_url", jd.get("form_url")) or "").strip()
+    # A position using a shared form takes the link from the Forms page.
+    form_url = (jd.get("form_url") if jd.get("form_id") else body.get("form_url", jd.get("form_url")) or "").strip()
     if form_url and not _FORM_URL_RE.match(form_url):
         return _error("That doesn't look like a Google Form link. Open the form, click Send → the link icon, "
                       "and copy the link (it starts with https://docs.google.com/forms/ or https://forms.gle/).", 400)

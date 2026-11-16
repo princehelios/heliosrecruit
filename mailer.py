@@ -190,7 +190,7 @@ def send_test(role_folder_id: str, role_name: str, jd: dict | None) -> str:
     address so the team can see exactly what applicants will get."""
     form_url = ((jd or {}).get("form_url") or "").strip()
     if not form_url:
-        raise MailError("Add the Google Form link first.")
+        raise MailError("Pick a Google Form for this position first (Positions page), or add its link on the Forms page.")
     subject, body = template_for(jd)
     to = sender()["address"]
     msg = build(to, "[TEST] " + render(subject, name="Sample Applicant", position=role_name,
@@ -249,7 +249,7 @@ def _one(r: dict, jd: dict | None, smtp, index: SentIndex) -> None:
     form_url = ((jd or {}).get("form_url") or "").strip()
     try:
         if not form_url:
-            raise MailError(f"No Google Form link set for '{r['role_name']}'.")
+            raise MailError(f"'{r['role_name']}' has no Google Form - pick one on the Positions page.")
         if not valid_email(r["email"]):
             raise MailError(f"'{r['email']}' is not a valid email address.")
         if index.already_invited(r["email"], r["role_folder_id"]):

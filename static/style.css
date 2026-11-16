@@ -738,3 +738,27 @@ tbody tr.day-row td { background: var(--surface-2); font-weight: 700; font-size:
 @media (max-width: 640px) { .funnel-row { grid-template-columns: 90px 1fr 90px; } }
 
 .field input[type=file] { padding: 8px 0; }
+
+/* ---------- Forms page, position delete, source stats ---------- */
+.btn.danger-ghost { background: transparent; border-color: transparent; color: var(--bad); }
+.btn.danger-ghost:hover:not(:disabled) { background: var(--bad-soft, #fdecec); border-color: var(--bad-soft, #fdecec); }
+.pos-card-actions { display: flex; justify-content: space-between; align-items: center; margin-top: auto; gap: 8px; }
+.pos-card-actions .btn { margin-top: 0; }
+.pos-card-actions [data-del-pos] { color: var(--text-3); }
+.pos-card-actions [data-del-pos]:hover { color: var(--bad); }
+.form-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; }
+@media (max-width: 520px) { .form-list { grid-template-columns: 1fr; } }
+.form-dl { display: grid; grid-template-columns: 130px 1fr; gap: 8px 12px; margin: 0; font-size: 14px; }
+.form-dl dt { color: var(--text-3); font-size: 12.5px; padding-top: 2px; }
+.form-dl dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.chip { display: inline-block; padding: 2px 10px; margin: 0 4px 4px 0; border-radius: 999px; background: var(--surface-2, #f3f4f6); border: 1px solid var(--border); font-size: 13px; color: var(--text); text-decoration: none; }
+.chip:hover { border-color: var(--accent); }
+.check-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; }
+.check-row { display: flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; }
+.form-links { display: flex; flex-direction: column; gap: 3px; font-size: 13.5px; }
+.source-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.source-tile { display: block; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: inherit; text-decoration: none; }
+.source-tile:hover { border-color: var(--accent); }
+.source-tile .k { font-size: 12.5px; color: var(--text-3); font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.source-tile .v { font-size: 28px; font-weight: 800; margin: 2px 0; font-variant-numeric: tabular-nums; }
+.source-tile .n { font-size: 13px; color: var(--text-2); }

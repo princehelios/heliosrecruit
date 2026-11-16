@@ -156,6 +156,16 @@ def home(range_key: str = "7") -> dict:
         "walkins": sum(1 for a in rows if a["source"] == "walkin"),
         "in_recruit": sum(1 for a in rows if a["recruit_status"] == "saved"),
     }
+    # Where the resumes came from, and how far each source got.
+    sources = {}
+    for key in ("gmail", "upload", "walkin"):
+        group = [a for a in rows if a["source"] == key]
+        sources[key] = {
+            "received": len(group),
+            "form_sent": sum(1 for a in group if a["step"] not in ("new", "no_email") and key != "walkin"),
+            "qualified": sum(1 for a in group if a["step"] == "qualified"),
+            "in_recruit": sum(1 for a in group if a["recruit_status"] == "saved"),
+        }
     # To-do counts are about now, whatever the date range.
     jds = storage.list_jds()
     todo = {
@@ -170,8 +180,13 @@ def home(range_key: str = "7") -> dict:
     positions: dict = {}
     for a in rows:
         p = positions.setdefault(a["role_id"], {"id": a["role_id"], "name": a["position"], "applied": 0,
-                                                "filled": 0, "screened": 0, "qualified": 0, "send": 0, "screen": 0})
+                                                "gmail": 0, "upload": 0, "walkin": 0, "form_sent": 0,
+                                                "filled": 0, "screened": 0, "qualified": 0, "in_recruit": 0,
+                                                "send": 0, "screen": 0})
         p["applied"] += 1
+        p[a["source"] if a["source"] in ("gmail", "upload", "walkin") else "gmail"] += 1
+        p["form_sent"] += 1 if a["source"] != "walkin" and a["step"] not in ("new", "no_email") else 0
+        p["in_recruit"] += 1 if a["recruit_status"] == "saved" else 0
         p["filled"] += 1 if (a["form_filled_at"] or a["step"] in ("qualified", "not_qualified")) else 0
         p["screened"] += 1 if a["step"] in ("qualified", "not_qualified") else 0
         p["qualified"] += 1 if a["step"] == "qualified" else 0
@@ -183,9 +198,9 @@ def home(range_key: str = "7") -> dict:
         p["rate"] = round(100 * p["qualified"] / p["screened"]) if p["screened"] else None
         jd = jds.get(p["id"]) or {}
         p["setup_missing"] = [k for k, ok in (("job description", (jd.get("jd_text") or "").strip()),
-                                              ("Google Form link", jd.get("form_url")),
+                                              ("Google Form", jd.get("form_url")),
                                               ("response sheet", jd.get("form_sheet_url"))) if not ok]
-    return {"range": range_key, "funnel": funnel, "todo": todo,
+    return {"range": range_key, "funnel": funnel, "todo": todo, "sources": sources,
             "positions": sorted(positions.values(), key=lambda p: -p["applied"]),
             "queue": queue_status()}
 

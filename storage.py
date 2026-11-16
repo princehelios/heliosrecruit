@@ -233,6 +233,7 @@ _MIGRATIONS = {
         "form_url": "TEXT",                         # the Google Form itself (sent to applicants)
         "invite_subject": "TEXT",                   # invite email template (NULL = default)
         "invite_body": "TEXT",
+        "form_id": "INTEGER",                       # the shared Google Form it uses (forms table)
     },
     "runs": {
         "form_pending": "INTEGER NOT NULL DEFAULT 0",  # resumes parked until the form is filled
@@ -259,9 +260,25 @@ _MIGRATIONS = {
 }
 
 
+_FORMS_SCHEMA = """
+-- Google Forms, set up once on the Forms page and assigned to positions.
+-- A position copies its form's links into job_descriptions.form_url /
+-- form_sheet_url, so sending and form-checking read them as before.
+CREATE TABLE IF NOT EXISTS forms (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    form_url    TEXT,
+    sheet_url   TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+"""
+
+
 def init_db() -> None:
     with _conn() as c:
         c.executescript(SCHEMA)
+        c.executescript(_FORMS_SCHEMA)
         for table, columns in _MIGRATIONS.items():
             existing = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
             for name, decl in columns.items():
@@ -296,7 +313,10 @@ def save_jd(role_folder_id: str, role_name: str, jd_text: str, pass_threshold: i
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(role_folder_id) DO UPDATE SET
                  role_name = excluded.role_name, jd_text = excluded.jd_text,
-                 pass_threshold = excluded.pass_threshold, form_sheet_url = excluded.form_sheet_url,
+                 pass_threshold = excluded.pass_threshold,
+                 form_id = CASE WHEN IFNULL(form_sheet_url, '') = IFNULL(excluded.form_sheet_url, '')
+                                THEN form_id END,
+                 form_sheet_url = excluded.form_sheet_url,
                  updated_at = excluded.updated_at""",
             (role_folder_id, role_name, jd_text, pass_threshold, form_sheet_url or None, now()),
         )
@@ -311,7 +331,10 @@ def set_form_sheet(role_folder_id: str, role_name: str, url: str | None) -> dict
             """INSERT INTO job_descriptions (role_folder_id, role_name, jd_text, pass_threshold, form_sheet_url, updated_at)
                VALUES (?, ?, '', ?, ?, ?)
                ON CONFLICT(role_folder_id) DO UPDATE SET
-                 role_name = excluded.role_name, form_sheet_url = excluded.form_sheet_url,
+                 role_name = excluded.role_name,
+                 form_id = CASE WHEN IFNULL(form_sheet_url, '') = IFNULL(excluded.form_sheet_url, '')
+                                THEN form_id END,
+                 form_sheet_url = excluded.form_sheet_url,
                  updated_at = excluded.updated_at""",
             (role_folder_id, role_name, config.BAND_MEDIUM, url or None, now()),
         )
@@ -328,7 +351,9 @@ def set_invite_settings(role_folder_id: str, role_name: str, form_url: str | Non
                                              form_url, invite_subject, invite_body, updated_at)
                VALUES (?, ?, '', ?, ?, ?, ?, ?)
                ON CONFLICT(role_folder_id) DO UPDATE SET
-                 role_name = excluded.role_name, form_url = excluded.form_url,
+                 role_name = excluded.role_name,
+                 form_id = CASE WHEN IFNULL(form_url, '') = IFNULL(excluded.form_url, '') THEN form_id END,
+                 form_url = excluded.form_url,
                  invite_subject = excluded.invite_subject, invite_body = excluded.invite_body,
                  updated_at = excluded.updated_at""",
             (role_folder_id, role_name, config.BAND_MEDIUM, form_url or None, subject or None, body or None, now()),
@@ -350,6 +375,127 @@ def restore_role_settings(role_folder_id: str, role_name: str, s: dict) -> bool:
              s.get("updated_at") or now()),
         )
         return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------- shared Google Forms
+
+def _adopt_unlinked_forms(c) -> None:
+    """Positions set up before the Forms page (or restored from their WorkDrive
+    settings file) have links but no form: group them by their links and
+    create one form per group, so every link shows up on the Forms page."""
+    groups: dict = {}
+    for r in c.execute("""SELECT role_folder_id, role_name, form_url, form_sheet_url FROM job_descriptions
+                          WHERE form_id IS NULL AND (IFNULL(form_url, '') != '' OR IFNULL(form_sheet_url, '') != '')
+                          ORDER BY role_name"""):
+        groups.setdefault((r["form_url"] or "", r["form_sheet_url"] or ""), []).append(r)
+    for (form_url, sheet_url), rows in groups.items():
+        same = c.execute("SELECT id FROM forms WHERE IFNULL(form_url, '') = ? AND IFNULL(sheet_url, '') = ?",
+                         (form_url, sheet_url)).fetchone()
+        if same:
+            fid = same["id"]
+        else:
+            name = f"{rows[0]['role_name']} form" if len(rows) == 1 else "Shared form"
+            taken = {r["name"] for r in c.execute("SELECT name FROM forms")}
+            base, k = name, 2
+            while name in taken:
+                name, k = f"{base} {k}", k + 1
+            fid = c.execute("INSERT INTO forms (name, form_url, sheet_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (name, form_url or None, sheet_url or None, now(), now())).lastrowid
+        c.executemany("UPDATE job_descriptions SET form_id = ? WHERE role_folder_id = ?",
+                      [(fid, r["role_folder_id"]) for r in rows])
+
+
+def list_forms() -> list:
+    with _conn() as c:
+        _adopt_unlinked_forms(c)
+        forms = [dict(r) for r in c.execute("SELECT * FROM forms ORDER BY name COLLATE NOCASE")]
+        used: dict = {}
+        for r in c.execute("SELECT role_folder_id, role_name, form_id FROM job_descriptions "
+                           "WHERE form_id IS NOT NULL ORDER BY role_name COLLATE NOCASE"):
+            used.setdefault(r["form_id"], []).append({"id": r["role_folder_id"], "name": r["role_name"]})
+    for f in forms:
+        f["positions"] = used.get(f["id"], [])
+    return forms
+
+
+def get_form(form_id: int):
+    with _conn() as c:
+        return _row(c.execute("SELECT * FROM forms WHERE id = ?", (form_id,)).fetchone())
+
+
+def save_form(form_id: int | None, name: str, form_url: str | None, sheet_url: str | None) -> tuple[dict, list]:
+    """Creates or updates a form. Every position using it gets the new links.
+    Returns (form, ids of the positions whose links changed)."""
+    with _conn() as c:
+        if form_id:
+            c.execute("UPDATE forms SET name = ?, form_url = ?, sheet_url = ?, updated_at = ? WHERE id = ?",
+                      (name, form_url or None, sheet_url or None, now(), form_id))
+        else:
+            form_id = c.execute("INSERT INTO forms (name, form_url, sheet_url, created_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (name, form_url or None, sheet_url or None, now(), now())).lastrowid
+        changed = [r["role_folder_id"] for r in c.execute(
+            """SELECT role_folder_id FROM job_descriptions WHERE form_id = ?
+               AND (IFNULL(form_url, '') != ? OR IFNULL(form_sheet_url, '') != ?)""",
+            (form_id, form_url or "", sheet_url or ""))]
+        c.execute("UPDATE job_descriptions SET form_url = ?, form_sheet_url = ?, updated_at = ? WHERE form_id = ?",
+                  (form_url or None, sheet_url or None, now(), form_id))
+    return get_form(form_id), changed
+
+
+def assign_form(role_folder_id: str, role_name: str, form_id: int | None) -> None:
+    """Points a position at a form (copying its links), or at none."""
+    form = get_form(form_id) if form_id else None
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO job_descriptions (role_folder_id, role_name, jd_text, pass_threshold,
+                                             form_id, form_url, form_sheet_url, updated_at)
+               VALUES (?, ?, '', ?, ?, ?, ?, ?)
+               ON CONFLICT(role_folder_id) DO UPDATE SET
+                 role_name = excluded.role_name, form_id = excluded.form_id, form_url = excluded.form_url,
+                 form_sheet_url = excluded.form_sheet_url, updated_at = excluded.updated_at""",
+            (role_folder_id, role_name, config.BAND_MEDIUM, form["id"] if form else None,
+             (form or {}).get("form_url"), (form or {}).get("sheet_url"), now()))
+
+
+def form_position_ids(form_id: int) -> list:
+    with _conn() as c:
+        return [r["role_folder_id"] for r in c.execute(
+            "SELECT role_folder_id FROM job_descriptions WHERE form_id = ?", (form_id,))]
+
+
+def delete_form(form_id: int) -> list:
+    """Deletes a form; its positions are left without one. Returns their ids."""
+    ids = form_position_ids(form_id)
+    with _conn() as c:
+        c.execute("""UPDATE job_descriptions SET form_id = NULL, form_url = NULL, form_sheet_url = NULL,
+                     updated_at = ? WHERE form_id = ?""", (now(), form_id))
+        c.execute("DELETE FROM forms WHERE id = ?", (form_id,))
+    return ids
+
+
+# ---------------------------------------------------------------- deleted folders
+
+def forget_folder(folder_id: str, *, position: bool, role_folder_id: str, walkin_folder: bool = False) -> int:
+    """After a folder went to WorkDrive trash: drops the applicants whose
+    resumes were in it, so they stop showing in the app. Screening history
+    (Activity) is kept. Returns how many applicants were removed."""
+    with _conn() as c:
+        if position:
+            n = c.execute("DELETE FROM form_invites WHERE role_folder_id = ?", (folder_id,)).rowcount
+            n += c.execute("DELETE FROM walkins WHERE role_folder_id = ?", (folder_id,)).rowcount
+            c.execute("DELETE FROM form_pending WHERE role_folder_id = ?", (folder_id,))
+            c.execute("DELETE FROM job_descriptions WHERE role_folder_id = ?", (folder_id,))
+            return n
+        parked = [r["file_id"] for r in c.execute(
+            "SELECT file_id FROM form_pending WHERE pending_folder_id = ?", (folder_id,))]
+        n = c.execute("DELETE FROM form_invites WHERE folder_id = ?", (folder_id,)).rowcount
+        for fid in parked:
+            n += c.execute("DELETE FROM form_invites WHERE file_id = ?", (fid,)).rowcount
+        c.execute("DELETE FROM form_pending WHERE pending_folder_id = ?", (folder_id,))
+        if walkin_folder:
+            n += c.execute("DELETE FROM walkins WHERE role_folder_id = ?", (role_folder_id,)).rowcount
+        return n
 
 
 def rename_role(role_folder_id: str, role_name: str) -> None:

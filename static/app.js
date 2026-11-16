@@ -197,7 +197,7 @@ async function route() {
   let m;
   const nav = (hash === "#/" || hash.startsWith("#/home")) ? "home"
     : hash.startsWith("#/applicant") ? "applicants" : hash.startsWith("#/positions") ? "positions"
-    : hash.startsWith("#/settings") ? "settings"
+    : hash.startsWith("#/settings") ? "settings" : hash.startsWith("#/forms") ? "forms"
     : hash.startsWith("#/dashboard") ? "dashboard" : hash.startsWith("#/candidates") ? "candidates"
     : hash.startsWith("#/pending") ? "pending" : hash.startsWith("#/sheets") ? "sheets"
     : hash.startsWith("#/invites") ? "invites"
@@ -210,6 +210,7 @@ async function route() {
   if (nav === "applicants") return renderApplicants(view);
   if (nav === "positions") return renderPositions(view);
   if (nav === "settings") return renderSettings(view);
+  if (nav === "forms") return renderForms(view);
   if (nav === "dashboard") return renderDashboard(view);
   if (nav === "candidates") return renderCandidates(view);
   if (nav === "pending") return renderPending(view);
@@ -1222,12 +1223,13 @@ function deleteFilesDialog(data) {
   });
 }
 
-function deleteFolderDialog(data) {
+function deleteFolderDialog(data, after) {
   const f = data.folder;
   const inside = data.files.length + data.subfolders.reduce((n, s) => n + (s.resume_count || 0), 0);
   openModal(`
     <h2>Delete folder "${esc(f.name)}"?</h2>
     <p>The folder${inside ? ` and the <b>${plural(inside, "resume")}</b> in it` : ""}${data.subfolders.length ? ` (including ${plural(data.subfolders.length, "subfolder")})` : ""} move to the WorkDrive trash, restorable for 30 days.</p>
+    <p class="muted small">Applicants whose resumes are in it are removed from the app's lists${data.depth <= 1 ? ", together with this position's job description and form choice" : ""}. Screening history stays in Activity.</p>
     <div class="field"><label for="delete-confirm">Type the folder name to confirm</label>
       <input type="text" id="delete-confirm" autocomplete="off" placeholder="${esc(f.name)}"></div>
     <div class="modal-actions">
@@ -1242,7 +1244,10 @@ function deleteFolderDialog(data) {
     try {
       const out = await api(`/api/folders/${encodeURIComponent(f.id)}`, { method: "DELETE" });
       closeModal();
-      toast(`"${f.name}" moved to WorkDrive trash`, "success");
+      toast(`"${f.name}" moved to WorkDrive trash${out.removed ? ` · ${plural(out.removed, "applicant")} removed from the app` : ""}`, "success");
+      state.browse?.clear?.();
+      loadApplicantsBadge();
+      if (after) return after(out);
       location.hash = data.depth <= 1 ? "#/files" : `#/folder/${out.parent_id}`;
     } catch (e) { toast(e.message, "error"); $("#delete-go").disabled = false; }
   });
@@ -2238,9 +2243,9 @@ function inviteDialog(role, onSaved) {
       <h2>Google Form invite · ${esc(role.name)}</h2>
       <p class="muted small">Sent from <b>${esc(cfg.from)}</b> to applicants you select on the Form invites page.
         Placeholders: <code>{first_name}</code> <code>{name}</code> <code>{position}</code> <code>{form_link}</code></p>
-      <div class="field"><label for="inv-url">Google Form link</label>
-        <input type="text" id="inv-url" placeholder="https://forms.gle/…  or  https://docs.google.com/forms/…" value="${esc(cfg.form_url)}">
-        <div class="muted small">In the form click <b>Send</b> → the link icon → Copy. Use the form link, not the response sheet.</div></div>
+      <div class="callout ${cfg.form_url ? "info" : "warn"}"><div>${cfg.form_url
+        ? `Google Form: <b>${esc(cfg.form_name || "set")}</b> · ${link(cfg.form_url, "open")}`
+        : "No Google Form picked for this position yet."} Forms are managed in one place on the <a href="#/forms" data-close>Forms</a> page.</div></div>
       <div class="field"><label for="inv-subject">Email subject</label>
         <input type="text" id="inv-subject" value="${esc(cfg.invite_subject || cfg.default_subject)}"></div>
       <div class="field"><label for="inv-body">Email text</label>
@@ -2254,7 +2259,7 @@ function inviteDialog(role, onSaved) {
       </div>`, { wide: true });
     $("#inv-reset").addEventListener("click", () => { $("#inv-subject").value = cfg.default_subject; $("#inv-body").value = cfg.default_body; });
     const save = async () => api(`/api/roles/${encodeURIComponent(role.id)}/invite`, { method: "PUT", body: {
-      form_url: $("#inv-url").value.trim(), invite_subject: $("#inv-subject").value, invite_body: $("#inv-body").value } });
+      invite_subject: $("#inv-subject").value, invite_body: $("#inv-body").value } });
     const busy = (b, on, label) => { b.disabled = on; b.innerHTML = on ? `<span class="spinner"></span>` : label; };
     $("#inv-save").addEventListener("click", async () => {
       const b = $("#inv-save"); busy(b, true);
@@ -2423,7 +2428,8 @@ const STEP_TAG = {
 const AP_TABS = [["all", "All"], ["new", "New: send form"], ["sent", "Waiting for form"],
   ["filled", "Form filled: screen"], ["qualified", "Qualified"], ["not_qualified", "Not qualified"]];
 const RANGES = [["7", "Last 7 days"], ["30", "Last 30 days"], ["today", "Today"], ["all", "All time"]];
-const ap = { tab: "all", role: "", q: "", range: "all", selected: new Set(), poll: null, data: null };
+const ap = { tab: "all", role: "", source: "", q: "", range: "all", selected: new Set(), poll: null, data: null };
+const SOURCES = [["gmail", "From Gmail"], ["upload", "Uploaded"], ["walkin", "Walk-in"]];
 
 function daysAgo(iso) {
   if (!iso) return "";
@@ -2486,7 +2492,7 @@ async function renderHome(view, { quiet = false } = {}) {
   if (!quiet) loading(view);
   let d;
   try { d = await api(`/api/home?range=${encodeURIComponent(range)}`); } catch (e) { return errorView(view, e.message); }
-  const f = d.funnel, t = d.todo;
+  const f = d.funnel, t = d.todo, src = d.sources;
   const pct = (n, of) => of ? Math.round(100 * n / of) : 0;
   const bar = (label, n, of, note, cls = "") => `<a class="funnel-row" href="#/applicants">
       <span class="funnel-label">${label}</span>
@@ -2507,7 +2513,7 @@ async function renderHome(view, { quiet = false } = {}) {
       <section class="todo-grid" aria-label="To do">
         <div class="todo-card"><div class="todo-top"><span class="todo-num blue">1</span>New applicants</div>
           <div class="todo-big">${t.send + t.no_email} <span>applicants</span></div>
-          <div class="todo-text">${t.send + t.no_email ? `Haven't got the Google Form yet.${t.no_email ? ` ${t.no_email} have no email - add it first.` : ""}${t.send_blocked ? ` ${t.send_blocked} are for positions without a form link.` : ""}` : "Everyone has been sent the form."}</div>
+          <div class="todo-text">${t.send + t.no_email ? `Haven't got the Google Form yet.${t.no_email ? ` ${t.no_email} have no email - add it first.` : ""}${t.send_blocked ? ` ${t.send_blocked} are for positions without a Google Form.` : ""}` : "Everyone has been sent the form."}</div>
           <a class="btn ${t.send ? "primary" : ""}" href="#/applicants?tab=new">${t.send ? `Review & send form (${t.send})` : "Open"}</a></div>
         <div class="todo-card"><div class="todo-top"><span class="todo-num purple">2</span>Form filled</div>
           <div class="todo-big">${t.screen} <span>ready to screen</span></div>
@@ -2519,6 +2525,15 @@ async function renderHome(view, { quiet = false } = {}) {
           <div class="todo-text">${f.high} High · ${f.medium} Medium · ${f.in_recruit} in Zoho Recruit${f.walkins ? ` · ${f.walkins} walk-in(s)` : ""}</div>
           <a class="btn" href="#/applicants?tab=qualified">See qualified</a></div>
       </section>
+
+      <section class="card"><div class="card-head"><h2>Resumes received</h2><span class="muted small">${esc(RANGES.find(r => r[0] === range)?.[1].toLowerCase() || "")}</span></div>
+        <div class="card-body"><div class="source-grid">
+          <a class="source-tile" href="#/applicants?source="><div class="k">All resumes</div><div class="v">${src.gmail.received + src.upload.received + src.walkin.received}</div>
+            <div class="n">${src.gmail.form_sent + src.upload.form_sent} sent the form · ${src.gmail.in_recruit + src.upload.in_recruit + src.walkin.in_recruit} in Zoho Recruit</div></a>
+          ${[["gmail", "From Gmail"], ["upload", "Uploaded"], ["walkin", "Walk-ins"]].map(([k, label]) => `
+          <a class="source-tile" href="#/applicants?source=${k}"><div class="k">${label}</div><div class="v">${src[k].received}</div>
+            <div class="n">${k === "walkin" ? "" : `${src[k].form_sent} sent the form · `}${src[k].qualified} qualified · ${src[k].in_recruit} in Recruit</div></a>`).join("")}
+        </div></div></section>
 
       <section class="card"><div class="card-head"><h2>From applied to qualified</h2><span class="muted small">Gmail + uploaded applicants, ${esc(RANGES.find(r => r[0] === range)?.[1].toLowerCase() || "")}</span></div>
         <div class="card-body">${f.applied ? `<div class="funnel">
@@ -2535,12 +2550,12 @@ async function renderHome(view, { quiet = false } = {}) {
 
       <section class="card"><div class="card-head"><h2>By position</h2><a href="#/positions" class="small"><b>Set up positions</b></a></div>
         ${d.positions.length ? `<div class="table-wrap"><table>
-          <thead><tr><th>Position</th><th class="num">Applied</th><th class="num">Form filled</th><th class="num">Qualified</th><th>Qualify rate</th><th>Next step</th></tr></thead>
+          <thead><tr><th>Position</th><th class="num">Received</th><th class="num" title="From Gmail / uploaded / walk-in">Gmail/Upl./Walk-in</th><th class="num">Form sent</th><th class="num">Form filled</th><th class="num">Qualified</th><th class="num">In Recruit</th><th class="num">Qualify rate</th><th>Next step</th></tr></thead>
           <tbody>${d.positions.map(p => `<tr>
             <td><a href="#/applicants?role=${esc(p.id)}"><b>${esc(p.name)}</b></a>
               ${p.setup_missing.length ? `<div class="secondary-text" style="color:var(--bad)">Missing: ${esc(p.setup_missing.join(", "))}</div>` : ""}</td>
-            <td class="num">${p.applied}</td><td class="num">${p.filled}</td><td class="num"><b style="color:var(--good)">${p.qualified}</b></td>
-            <td>${p.rate == null ? `<span class="muted small">not screened yet</span>` : `<span class="rate"><span class="rate-track"><span style="width:${p.rate}%"></span></span>${p.rate}%</span>`}</td>
+            <td class="num"><b>${p.applied}</b></td><td class="num muted">${p.gmail} · ${p.upload} · ${p.walkin}</td><td class="num">${p.form_sent}</td><td class="num">${p.filled}</td><td class="num"><b style="color:var(--good)">${p.qualified}</b></td><td class="num">${p.in_recruit}</td>
+            <td class="num">${p.rate == null ? `<span class="muted small">—</span>` : `${p.rate}%`}</td>
             <td>${p.setup_missing.length ? `<a class="btn sm" href="#/positions?id=${esc(p.id)}">Finish setup</a>`
               : p.screen ? `<a class="btn sm primary" href="#/applicants?tab=filled&role=${esc(p.id)}">Screen ${p.screen}</a>`
               : p.send ? `<a class="btn sm primary" href="#/applicants?tab=new&role=${esc(p.id)}">Send form to ${p.send}</a>`
@@ -2593,10 +2608,11 @@ async function renderApplicants(view, { quiet = false } = {}) {
   if (!quiet) {
     ap.tab = p.get("tab") || ap.tab || "all";
     ap.role = p.has("role") ? p.get("role") : "";
+    ap.source = p.has("source") ? p.get("source") : ap.source;
     ap.selected.clear();
     loading(view);
   }
-  const qs = new URLSearchParams({ tab: ap.tab, role: ap.role, q: ap.q, range: ap.range });
+  const qs = new URLSearchParams({ tab: ap.tab, role: ap.role, source: ap.source, q: ap.q, range: ap.range });
   let d;
   try { d = await api(`/api/applicants?${qs}`); } catch (e) { return errorView(view, e.message); }
   ap.data = d;
@@ -2607,7 +2623,7 @@ async function renderApplicants(view, { quiet = false } = {}) {
   const action = a => {
     if (a.step === "new") return formFor[a.role_id]
       ? `<button class="btn sm primary" data-send="${esc(a.id)}">Send form</button>`
-      : `<a class="btn sm" href="#/positions?id=${esc(a.role_id)}" title="This position has no Google Form link yet">Add form link</a>`;
+      : `<a class="btn sm" href="#/positions?id=${esc(a.role_id)}" title="This position has no Google Form yet">Pick a form</a>`;
     if (a.step === "no_email") return `<button class="btn sm" data-dismiss="${a.invite_id}">Dismiss</button>`;
     if (a.step === "filled" || a.step === "error") return `<button class="btn sm primary" data-screen="${esc(a.id)}">${a.step === "error" ? "Screen again" : "Screen"}</button>`;
     if (a.step === "sent") return `<span class="muted small">waiting</span>`;
@@ -2632,6 +2648,7 @@ async function renderApplicants(view, { quiet = false } = {}) {
       <div class="filters">
         <label class="search-box">${I.search}<input type="search" id="ap-q" placeholder="Search name or email" aria-label="Search applicants" value="${esc(ap.q)}"></label>
         <select id="ap-role" aria-label="Position"><option value="">All positions</option>${d.roles.map(r => `<option value="${esc(r.id)}" ${r.id === ap.role ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select>
+        <select id="ap-source" aria-label="Source"><option value="">All sources</option>${SOURCES.map(([v, l]) => `<option value="${v}" ${v === ap.source ? "selected" : ""}>${l}</option>`).join("")}</select>
         <select id="ap-range" aria-label="Applied">${[["all", "Any time"], ...RANGES.filter(r => r[0] !== "all")].map(([v, l]) => `<option value="${v}" ${v === ap.range ? "selected" : ""}>${l}</option>`).join("")}</select>
       </div>
       <div id="ap-bulk"></div>
@@ -2640,7 +2657,7 @@ async function renderApplicants(view, { quiet = false } = {}) {
           <th>Applicant</th><th>Position</th><th>Step</th><th>Applied</th><th class="right">Next</th></tr></thead>
         <tbody>${d.items.map(a => `<tr class="${ap.selected.has(a.id) ? "selected" : ""}">
           <td class="check">${pickable(a) ? `<input type="checkbox" data-pick="${esc(a.id)}" ${ap.selected.has(a.id) ? "checked" : ""} aria-label="Select ${esc(a.name)}">` : ""}</td>
-          <td><a class="primary-text" href="#/applicant/${esc(a.id)}">${esc(a.name)}</a>${a.source === "walkin" ? ` <span class="tag">Walk-in</span>` : a.source === "upload" ? ` <span class="tag">Uploaded</span>` : ""}<div>${emailCell(a)}</div></td>
+          <td><a class="primary-text" href="#/applicant/${esc(a.id)}">${esc(a.name)}</a>${a.source === "walkin" ? ` <span class="tag">Walk-in</span>` : a.source === "upload" ? ` <span class="tag">Uploaded</span>` : ` <span class="tag blue">Gmail</span>`}<div>${emailCell(a)}</div></td>
           <td class="small">${esc(a.position)}</td>
           <td>${stepPill(a)}<div class="secondary-text">${esc(stepNote(a))}</div></td>
           <td class="muted small nowrap">${esc(shortDate(a.applied_at))}</td>
@@ -2671,6 +2688,7 @@ async function renderApplicants(view, { quiet = false } = {}) {
   $$("[data-tab]", view).forEach(b => b.addEventListener("click", () => { ap.tab = b.dataset.tab; go(); }));
   $("#ap-role").addEventListener("change", e => { ap.role = e.target.value; go(); });
   $("#ap-range").addEventListener("change", e => { ap.range = e.target.value; go(); });
+  $("#ap-source").addEventListener("change", e => { ap.source = e.target.value; go(); });
   let qTimer;
   $("#ap-q").addEventListener("input", e => { clearTimeout(qTimer); qTimer = setTimeout(() => { ap.q = e.target.value.trim(); go(); }, 300); });
   $("#ap-dismissed").addEventListener("click", e => { e.preventDefault(); ap.tab = "dismissed"; go(); });
@@ -2762,54 +2780,73 @@ async function renderPositions(view) {
   let d;
   try { d = await api("/api/roles"); } catch (e) { return errorView(view, e.message); }
   const openId = hashParams().get("id") || "";
-  const setup = r => [["Job description", r.has_jd], ["Google Form link", !!r.form_url], ["Response sheet", !!r.form_sheet_url]];
+  const setup = r => [["Job description", r.has_jd], [r.form_name ? `Form: ${r.form_name}` : "Google Form", !!r.form_url], ["Response sheet", !!r.form_sheet_url]];
   const nSet = r => setup(r).filter(x => x[1]).length;
   const roles = d.roles.slice().sort((x, y) => nSet(x) - nSet(y) || x.name.localeCompare(y.name));
 
   view.innerHTML = `
     <div class="page-head"><div><h1>Positions</h1>
-      <div class="sub">Set each position up once. A position appears here by itself when Gmail brings its first applicant.
-        Settings are also saved in the position's WorkDrive folder.</div></div>
-      <div class="head-actions"><a class="btn" href="#/files">Browse files</a></div></div>
+      <div class="sub">One WorkDrive folder per position. Gmail files each application into the folder named after the job post
+        (it's created the first time). Pick a job description and a Google Form for each.</div></div>
+      <div class="head-actions"><a class="btn" href="#/forms">Manage Google Forms</a><a class="btn" href="#/files">Browse files</a></div></div>
     <div class="stack">
       ${roles.length ? `<section class="pos-grid">${roles.map(r => {
         const n = nSet(r), ready = n === 3;
         return `<div class="pos-card ${r.id === openId ? "open" : ""}">
           <div class="pos-card-top"><b>${esc(r.name)}</b><span class="tag ${ready ? "good" : "warn"}">${ready ? "Ready" : `${n} of 3 set`}</span></div>
-          <ul class="pos-checks">${setup(r).map(([label, okv]) => `<li class="${okv ? "ok" : ""}">${okv ? "✓" : "○"} ${label}</li>`).join("")}</ul>
-          <a class="btn ${ready ? "" : "primary"}" href="#/positions?id=${esc(r.id)}">${ready ? "Edit" : "Finish setup"}</a></div>`;
+          <ul class="pos-checks">${setup(r).map(([label, okv]) => `<li class="${okv ? "ok" : ""}">${okv ? "✓" : "○"} ${esc(label)}</li>`).join("")}</ul>
+          <div class="pos-card-actions"><a class="btn ${ready ? "" : "primary"}" href="#/positions?id=${esc(r.id)}">${ready ? "Edit" : "Finish setup"}</a>
+            <button class="btn ghost sm" data-del-pos="${esc(r.id)}" title="Delete this position folder" aria-label="Delete ${esc(r.name)}">${I.trash}</button></div></div>`;
       }).join("")}</section>` : `<div class="card"><div class="card-body"><div class="empty">${I.inbox}<strong>No positions yet</strong>They appear when Gmail brings in their first applicant.</div></div></div>`}
       <div id="pos-editor"></div>
     </div>`;
+  $$("[data-del-pos]", view).forEach(b => b.addEventListener("click", () => deletePosition(b.dataset.delPos, view)));
   if (openId) {
     const role = d.roles.find(r => r.id === openId);
-    if (role) positionEditor(role, () => renderPositions(view));
+    if (role) positionEditor(role, () => renderPositions(view), view);
   }
 }
 
-async function positionEditor(role, onSaved) {
+/* Loads the folder's contents (for the resume count) and asks before trashing it. */
+async function deletePosition(id, view) {
+  let data;
+  try { data = await api(`/api/browse?live=1&folder_id=${encodeURIComponent(id)}`); } catch (e) { return toast(e.message, "error"); }
+  deleteFolderDialog(data, () => { if (location.hash.startsWith("#/positions?")) location.hash = "#/positions"; else renderPositions(view); });
+}
+
+async function positionEditor(role, onSaved, view) {
   const box = $("#pos-editor");
   box.innerHTML = `<section class="card"><div class="card-body"><span class="spinner"></span> Loading…</div></section>`;
-  let jd, inv;
+  let jd, inv, fm;
   try {
-    [jd, inv] = await Promise.all([api(`/api/roles/${encodeURIComponent(role.id)}/jd`), api(`/api/roles/${encodeURIComponent(role.id)}/invite`)]);
+    [jd, inv, fm] = await Promise.all([api(`/api/roles/${encodeURIComponent(role.id)}/jd`),
+      api(`/api/roles/${encodeURIComponent(role.id)}/invite`), api("/api/forms")]);
   } catch (e) { box.innerHTML = ""; return toast(e.message, "error"); }
   const subject = inv.invite_subject || inv.default_subject, body = inv.invite_body || inv.default_body;
   const preview = (body || "").replaceAll("{first_name}", "Asha").replaceAll("{name}", "Asha Verma")
     .replaceAll("{position}", role.name).replaceAll("{form_link}", inv.form_url || "[form link]");
   const stepNum = (okv, n) => `<span class="setup-num ${okv ? "ok" : ""}">${okv ? "✓" : n}</span>`;
+  const formInfo = id => {
+    const f = fm.forms.find(x => String(x.id) === String(id));
+    if (!f) return `<span class="muted small">No form: applicants of this position can't be sent one.</span>`;
+    return `<div class="form-links">
+      <span>${f.form_url ? `✓ Form link · ${link(f.form_url, "open")}` : `<span style="color:var(--bad)">○ no form link</span>`}</span>
+      <span>${f.sheet_url ? `✓ Response sheet · ${link(f.sheet_url, "open")}` : `<span style="color:var(--bad)">○ no response sheet</span>`}</span>
+      ${f.positions.length > 1 || (f.positions.length === 1 && f.positions[0].id !== role.id) ? `<span class="muted">Also used by ${esc(f.positions.filter(p => p.id !== role.id).map(p => p.name).join(", "))}</span>` : ""}</div>`;
+  };
   box.innerHTML = `<section class="card" id="pos-edit-card"><div class="card-head"><h2>Set up: ${esc(role.name)}</h2>
       <a class="small" href="#/folder/${esc(role.id)}"><b>Open files</b></a></div>
     <div class="card-body setup-steps">
       <div class="setup-step">${stepNum(!!(jd.jd_text || "").trim(), 1)}<div>
         <label for="ps-jd">Job description</label><div class="help">Every applicant is scored against this.</div>
         <textarea id="ps-jd" rows="6" placeholder="Paste the job description…">${esc(jd.jd_text || "")}</textarea></div></div>
-      <div class="setup-step">${stepNum(!!inv.form_url, 2)}<div>
-        <label for="ps-form">Google Form link</label><div class="help">The form applicants get by email. In the form: <b>Send → link icon → Copy</b>.</div>
-        <input type="text" id="ps-form" placeholder="https://forms.gle/…" value="${esc(inv.form_url)}"></div></div>
-      <div class="setup-step">${stepNum(!!role.form_sheet_url, 3)}<div>
-        <label for="ps-sheet">Form responses sheet</label><div class="help">${SHEET_HELP} This is how the app knows who filled the form.</div>
-        <input type="text" id="ps-sheet" placeholder="https://docs.google.com/spreadsheets/d/…" value="${esc(role.form_sheet_url || "")}"></div></div>
+      <div class="setup-step">${stepNum(!!(role.form_url && role.form_sheet_url), 2)}<div>
+        <label for="ps-form">Google Form</label>
+        <div class="help">Form links and response sheets are kept in one place, the <a href="#/forms"><b>Forms</b></a> page; one form can serve many positions.</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="ps-form" style="min-width:240px"><option value="">— No form —</option>${fm.forms.map(f => `<option value="${f.id}" ${f.id === role.form_id ? "selected" : ""}>${esc(f.name)}</option>`).join("")}</select>
+          <button class="btn" id="ps-new-form" type="button">+ New form</button></div>
+        <div id="ps-form-info" style="margin-top:8px">${formInfo(role.form_id)}</div></div></div>
       <div class="setup-step"><span class="setup-num ok">✓</span><div>
         <label>Email to applicants</label><div class="help">${inv.invite_subject || inv.invite_body ? "Your own text." : "The standard text."} What the applicant sees:</div>
         <div class="mail-preview"><div class="muted small">From: ${esc(inv.from)}</div>
@@ -2817,26 +2854,104 @@ async function positionEditor(role, onSaved) {
           <div style="white-space:pre-line">${esc(preview)}</div></div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="ps-template">Edit text / send a test</button></div></div></div>
     </div>
-    <div class="card-foot"><a class="btn" href="#/positions">Close</a><button class="btn primary" id="ps-save">Save</button></div></section>`;
+    <div class="card-foot"><button class="btn danger-ghost" id="ps-delete">${I.trash} Delete position folder…</button><span style="flex:1"></span>
+      <a class="btn" href="#/positions">Close</a><button class="btn primary" id="ps-save">Save</button></div></section>`;
   $("#pos-edit-card").scrollIntoView({ behavior: "smooth", block: "start" });
+  $("#ps-form").addEventListener("change", e => { $("#ps-form-info").innerHTML = formInfo(e.target.value); });
+  $("#ps-new-form").addEventListener("click", () => formDialog(null, fm.positions, saved => {
+    toast(`Form "${saved.name}" added`, "success");
+    onSaved();
+  }, [role.id]));
   $("#ps-template").addEventListener("click", () => inviteDialog(role, onSaved));
+  $("#ps-delete").addEventListener("click", () => deletePosition(role.id, view));
   $("#ps-save").addEventListener("click", async () => {
     const btn = $("#ps-save");
     btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Saving…`;
-    const jdText = $("#ps-jd").value.trim(), formUrl = $("#ps-form").value.trim(), sheet = $("#ps-sheet").value.trim();
+    const jdText = $("#ps-jd").value.trim(), formId = $("#ps-form").value;
     const errors = [];
     try {
       if (jdText !== (jd.jd_text || "").trim()) await api(`/api/roles/${encodeURIComponent(role.id)}/jd`, { method: "PUT", body: { jd_text: jdText } });
     } catch (e) { errors.push(`Job description: ${e.message}`); }
     try {
-      if (formUrl !== (inv.form_url || "")) await api(`/api/roles/${encodeURIComponent(role.id)}/invite`, { method: "PUT", body: { form_url: formUrl } });
-    } catch (e) { errors.push(`Form link: ${e.message}`); }
-    try {
-      if (sheet !== (role.form_sheet_url || "")) await saveSheet(role.id, sheet);
-    } catch (e) { errors.push(`Response sheet: ${e.message}`); }
+      if (String(formId) !== String(role.form_id || "")) await api(`/api/roles/${encodeURIComponent(role.id)}/form`, { method: "PUT", body: { form_id: formId ? Number(formId) : null } });
+    } catch (e) { errors.push(`Google Form: ${e.message}`); }
     if (errors.length) { errors.forEach(m => toast(m, "error")); btn.disabled = false; btn.textContent = "Save"; return; }
     toast(`${role.name} saved`, "success");
     onSaved();
+  });
+}
+
+/* ---------------------------------------------------------------- Google Forms (one place for every form) */
+
+async function renderForms(view) {
+  loading(view);
+  let d;
+  try { d = await api("/api/forms"); } catch (e) { return errorView(view, e.message); }
+  const without = d.positions.filter(p => !p.form_id || !d.forms.some(f => f.id === p.form_id));
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Google Forms</h1>
+      <div class="sub">Add each Google Form once, with its link and its responses sheet, then pick the positions that use it.
+        One form can serve many positions.</div></div>
+      <div class="head-actions"><button class="btn primary" id="add-form">+ Add form</button></div></div>
+    <div class="stack">
+      ${without.length ? `<div class="callout warn"><div><b>${plural(without.length, "position")} without a form:</b> ${esc(without.map(p => p.name).join(", "))}.
+        Applicants for these can't be sent a form until you assign one.</div></div>` : ""}
+      ${d.forms.length ? `<section class="form-list">${d.forms.map(f => `
+        <div class="card form-card"><div class="card-head"><h2>${esc(f.name)}</h2>
+            <span class="tag ${f.form_url && f.sheet_url ? "good" : "warn"}">${f.form_url && f.sheet_url ? "Ready" : f.form_url ? "No response sheet" : "No form link"}</span></div>
+          <div class="card-body">
+            <dl class="form-dl">
+              <dt>Form link</dt><dd>${f.form_url ? link(f.form_url, f.form_url) : `<span class="muted">not set</span>`}</dd>
+              <dt>Responses sheet</dt><dd>${f.sheet_url ? link(f.sheet_url, "open the sheet") : `<span class="muted">not set: the app can't tell who filled it</span>`}</dd>
+              <dt>Used by</dt><dd>${f.positions.length ? f.positions.map(p => `<a class="chip" href="#/positions?id=${esc(p.id)}">${esc(p.name)}</a>`).join(" ") : `<span class="muted">no position yet</span>`}</dd>
+            </dl></div>
+          <div class="card-foot"><button class="btn danger-ghost" data-del-form="${f.id}">${I.trash} Remove</button><span style="flex:1"></span>
+            <button class="btn primary" data-edit-form="${f.id}">Edit / assign positions</button></div></div>`).join("")}</section>`
+      : `<div class="card"><div class="card-body"><div class="empty">${I.inbox}<strong>No forms yet</strong>Click <b>+ Add form</b>, paste the form link and its responses sheet, and tick the positions that use it.</div></div></div>`}
+    </div>`;
+  const reload = () => renderForms(view);
+  $("#add-form").addEventListener("click", () => formDialog(null, d.positions, f => { toast(`Form "${f.name}" added`, "success"); reload(); }));
+  $$("[data-edit-form]", view).forEach(b => b.addEventListener("click", () =>
+    formDialog(d.forms.find(f => f.id === Number(b.dataset.editForm)), d.positions, f => { toast(`Form "${f.name}" saved`, "success"); reload(); })));
+  $$("[data-del-form]", view).forEach(b => b.addEventListener("click", async () => {
+    const f = d.forms.find(x => x.id === Number(b.dataset.delForm));
+    if (!confirm(`Remove the form "${f.name}" from the app?${f.positions.length ? `\n\n${plural(f.positions.length, "position")} will have no form until you pick another.` : ""}\n\nThe Google Form itself is not touched.`)) return;
+    try { await api(`/api/forms/${f.id}`, { method: "DELETE" }); toast(`"${f.name}" removed`, "success"); reload(); }
+    catch (e) { toast(e.message, "error"); }
+  }));
+}
+
+function formDialog(form, positions, onSaved, preselect = []) {
+  const f = form || { name: "", form_url: "", sheet_url: "", positions: [] };
+  const mine = new Set(form ? f.positions.map(p => p.id) : preselect);
+  openModal(`
+    <h2>${form ? `Edit form · ${esc(f.name)}` : "Add a Google Form"}</h2>
+    <div class="field"><label for="fd-name">Name</label>
+      <input type="text" id="fd-name" maxlength="120" value="${esc(f.name)}" placeholder="e.g. Sales form, Tech form"></div>
+    <div class="field"><label for="fd-url">Google Form link (sent to applicants)</label>
+      <input type="text" id="fd-url" value="${esc(f.form_url || "")}" placeholder="https://forms.gle/…">
+      <div class="muted small">In the form click <b>Send</b> → the link icon → Copy.</div></div>
+    <div class="field"><label for="fd-sheet">Responses sheet (how the app knows who filled it)</label>
+      <input type="text" id="fd-sheet" value="${esc(f.sheet_url || "")}" placeholder="https://docs.google.com/spreadsheets/d/…">
+      <div class="muted small">${SHEET_HELP}</div></div>
+    <div class="field"><label>Positions that use this form</label>
+      ${positions.length ? `<div class="check-list">${positions.map(p => {
+        const other = p.form_id && (!form || p.form_id !== form.id);
+        return `<label class="check-row"><input type="checkbox" value="${esc(p.id)}" ${mine.has(p.id) ? "checked" : ""}> ${esc(p.name)}
+          ${other ? `<span class="muted small">(uses another form now; ticking moves it here)</span>` : ""}</label>`;
+      }).join("")}</div>` : `<div class="muted small">No positions yet: they appear when Gmail brings the first applicant.</div>`}</div>
+    <div class="modal-actions"><button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="fd-save">${form ? "Save" : "Add form"}</button></div>`, { wide: true });
+  $("#fd-name").focus();
+  $("#fd-save").addEventListener("click", async () => {
+    const b = $("#fd-save"); b.disabled = true; b.innerHTML = `<span class="spinner"></span> Checking the sheet…`;
+    try {
+      const saved = await api(form ? `/api/forms/${form.id}` : "/api/forms", { method: form ? "PUT" : "POST", body: {
+        name: $("#fd-name").value, form_url: $("#fd-url").value.trim(), sheet_url: $("#fd-sheet").value.trim(),
+        position_ids: $$("#modal .check-list input:checked").map(i => i.value) } });
+      closeModal();
+      onSaved(saved);
+    } catch (e) { toast(e.message, "error"); b.disabled = false; b.textContent = form ? "Save" : "Add form"; }
   });
 }
 
