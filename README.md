@@ -277,3 +277,22 @@ Recruit me score fields banao (Candidates): `AI_Score` (Number), `Skill_Score` (
   auth lagana zaroori hai.
 
 # internal
+
+
+## Fetching Indeed resumes from a computer (fetch_to_site.py)
+
+Indeed shows the Render server a "Just a moment..." bot check, so the website's
+**Fetch new from Gmail** can't download Indeed resumes. Run the fetch on any
+office computer instead; it sends each resume to the website, which files it in
+WorkDrive (`<position> / <date>`) and lists it under Applicants:
+
+```
+pip install -r requirements.txt
+playwright install chromium
+python fetch_to_site.py            # new application mails of the last 7 days
+python fetch_to_site.py --days 30  # look further back
+python fetch_to_site.py --limit 5  # quick test
+```
+
+Needs `EMAIL_APP_PASSWORD` in `.env`. Safe to re-run: mails already on the
+website are skipped. Nothing is emailed to applicants.

@@ -15,6 +15,7 @@ import gzip
 import os
 import re
 import threading
+from datetime import datetime, timezone
 import traceback
 
 from flask import Flask, jsonify, render_template, request
@@ -785,6 +786,53 @@ def api_delete_folder(folder_id):
                           "WorkDrive trash from the app"
                           + (f"; {removed} applicant(s) in it removed from the app." if removed else "."))
     return jsonify({**out, "parent_id": meta["parent_id"], "removed": removed, "position": position})
+
+
+# ---------------------------------------------------------------- fetch helper (Gmail fetch run on a computer)
+# Indeed shows Render's server a bot check, so fetch_to_site.py downloads the
+# resumes on an office computer and hands each one to these two endpoints. The
+# resume is filed and listed exactly as the website's own Gmail fetch would.
+
+_import_lock = threading.Lock()
+
+
+@app.post("/api/import/known")
+def api_import_known():
+    """Which of these Gmail Message-IDs were fetched already (skip them)."""
+    ids = (request.get_json(force=True, silent=True) or {}).get("message_ids") or []
+    return jsonify({"known": [m for m in ids[:5000] if isinstance(m, str) and storage.email_already_fetched(m)]})
+
+
+@app.post("/api/import/resume")
+def api_import_resume():
+    f = request.files.get("file")
+    form = request.form
+    mid, position, name = (form.get("message_id") or "").strip(), (form.get("position") or "").strip(), \
+        (form.get("candidate") or "").strip() or "Candidate"
+    if not f or not mid or not position:
+        return _error("file, message_id and position are required.", 400)
+    content = f.read()
+    ext = email_fetcher._kind(content)
+    if not ext:
+        return _error("That file is not a PDF or DOCX resume.", 400)
+    try:
+        when = datetime.fromisoformat(form.get("applied_at") or "")
+    except ValueError:
+        when = datetime.now(timezone.utc)
+    job = {"mid": mid, "subject": form.get("subject") or "", "position": zoho_workdrive.clean_folder_name(position),
+           "name": name, "when": when, "reply_to": (form.get("reply_to") or "").strip().lower()}
+    with _import_lock:   # one at a time: the same email can never be filed twice
+        if storage.email_already_fetched(mid):
+            return jsonify({"skipped": True, "reason": "already fetched"})
+        filed = email_fetcher.file_resume(job["position"], when, f"{name}{ext}", content, {})
+        storage.mark_email_fetched(mid, job["position"], name, filed["file_name"], filed["file_id"])
+    storage.log("info", f"Email fetch (helper): {name} -> {filed['folder']}")
+    invite_email = ""
+    try:
+        invite_email = email_fetcher._queue_invite(job, filed, content, ext)
+    except Exception as e:  # noqa: BLE001 - the resume is saved; the applicant row is extra
+        storage.log("warn", f"Could not add {name} to Applicants: {e}")
+    return jsonify({"ok": True, "folder": filed["folder"], "file_id": filed["file_id"], "email": invite_email})
 
 
 # ---------------------------------------------------------------- walk-ins

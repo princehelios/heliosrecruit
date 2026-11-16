@@ -308,7 +308,7 @@ async def _describe_page(page) -> str:
     seen = f"{title!r} at {where}" if title else where
     if _BOT_HINTS.search(title + " " + text[:600]):
         raise IndeedBlockedError(f"Indeed showed a bot check instead of the resume ({seen}). Indeed blocks this server's IP; "
-                "fetch from a computer, or download the resume from Indeed and use Upload resumes.")
+                "run the fetch helper on a computer (python fetch_to_site.py), or download it from Indeed and use Upload resumes.")
     if _LOGIN_HINTS.search(title + " " + text[:600]) and "download" not in text.lower():
         raise IndeedBlockedError(f"Indeed asked to sign in instead of showing the resume ({seen}). The link only opens for a "
                 "logged-in employer account; download it from Indeed and use Upload resumes.")
@@ -465,8 +465,10 @@ def _message_ids(imap, ids: list) -> dict:
     return out
 
 
-def _scan() -> list[dict]:
-    """Logs in, finds mails not handled before and parses each into a job."""
+def _scan(known=None) -> list[dict]:
+    """Logs in, finds mails not handled before and parses each into a job.
+    `known(message_ids) -> set` says which were handled already (default: this
+    database; the fetch helper asks the website instead)."""
     try:
         imap = imaplib.IMAP4_SSL(config.EMAIL_IMAP_HOST)
         imap.login(config.EMAIL_ADDRESS, config.EMAIL_APP_PASSWORD)
@@ -480,7 +482,11 @@ def _scan() -> list[dict]:
         typ, data = imap.search(None, "SINCE", since, "SUBJECT", f'"{config.EMAIL_SUBJECT_FILTER}"')
         ids = data[0].split() if typ == "OK" and data and data[0] else []
         mids = _message_ids(imap, ids) if ids else {}
-        new = [n for n in ids if not (mids.get(n) and storage.email_already_fetched(mids[n]))]
+        if known is None:
+            done = {m for m in mids.values() if m and storage.email_already_fetched(m)}
+        else:
+            done = set(known([m for m in mids.values() if m]))
+        new = [n for n in ids if not (mids.get(n) and mids[n] in done)]
 
         for i in range(0, len(new), _IMAP_BATCH):  # bodies in batches, not one round trip each
             batch = new[i:i + _IMAP_BATCH]
