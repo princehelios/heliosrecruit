@@ -25,11 +25,18 @@ _POOL_SIZE = 32
 _retry = Retry(
     total=2,
     connect=2,
-    read=2,
+    # One retry after a read timeout, not two: each wait is the full read
+    # timeout (30 s), so two retries turned one slow call into a 90 s hang.
+    read=1,
     backoff_factor=0.6,                       # 0s, 0.6s, 1.2s
     status_forcelist=(429, 500, 502, 503, 504),
     allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
     raise_on_status=False,
+    # Zoho answers a burst with 429 + Retry-After (often a minute or more).
+    # Honouring it put every request thread to sleep with no limit, so pages
+    # hung instead of failing. Retry on our short backoff only; if Zoho is
+    # still throttling, the caller gets the 429 and shows it.
+    respect_retry_after_header=False,
 )
 
 
