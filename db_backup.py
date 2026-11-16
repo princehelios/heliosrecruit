@@ -77,9 +77,39 @@ def _db():
     return _client[config.MONGODB_DB]
 
 
+_OWN_COLLECTIONS = {f"{_BUCKET}.files", f"{_BUCKET}.chunks"}
+_RESERVED_DBS = {"admin", "local", "config"}
+_checked_db = False
+
+
+class ForeignDataError(Exception):
+    pass
+
+
+def _ensure_own_database(db) -> None:
+    """Safety guard: the cluster is shared with other apps. Refuse to read,
+    write or delete anything unless the database is empty or holds only this
+    app's own backup collections - so a wrong MONGODB_DB (e.g. another app's
+    database) can never touch, overwrite or delete someone else's data."""
+    global _checked_db
+    if _checked_db:
+        return
+    if db.name in _RESERVED_DBS:
+        raise ForeignDataError(f"MONGODB_DB='{db.name}' is a MongoDB system database. Use resume_screener.")
+    others = sorted(set(db.list_collection_names()) - _OWN_COLLECTIONS)
+    if others:
+        raise ForeignDataError(
+            f"MongoDB database '{db.name}' already holds other data ({', '.join(others[:5])}). "
+            "Backups are switched off so nothing there is touched. Set MONGODB_DB to a database "
+            "used only by this app (default: resume_screener).")
+    _checked_db = True
+
+
 def _bucket():
     import gridfs
-    return gridfs.GridFSBucket(_db(), bucket_name=_BUCKET)
+    db = _db()
+    _ensure_own_database(db)
+    return gridfs.GridFSBucket(db, bucket_name=_BUCKET)
 
 
 # ---------------------------------------------------------------- restore
@@ -164,6 +194,10 @@ def _loop() -> None:
         time.sleep(BACKUP_SECONDS)
         try:
             backup_now()
+        except ForeignDataError as e:
+            _state["error"] = str(e)
+            print(f"Mongo backup stopped: {e}")
+            return
         except Exception as e:  # noqa: BLE001 - keep trying next round
             _state["error"] = f"Backup failed: {e}"
             traceback.print_exc()
