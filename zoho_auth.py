@@ -18,6 +18,14 @@ _cached_token = {"value": None, "expires_at": 0, "scope": ""}
 # moment - wasted round trips, and Zoho rate-limits refresh calls.
 _refresh_lock = threading.Lock()
 
+# A failed refresh is remembered for this long and re-raised at once. Without
+# it, every caller queued on _refresh_lock retried Zoho one after another: a
+# single page load (dozens of folder listings + the warm-up) then waited
+# minutes behind the queue, and the burst of retries tripped Zoho's
+# refresh-token rate limit, which kept the failure going indefinitely.
+_FAILURE_COOLDOWN = 60
+_last_failure = {"error": None, "at": 0.0}
+
 
 class ZohoAuthError(Exception):
     pass
@@ -27,18 +35,34 @@ def _fresh(now: float) -> bool:
     return bool(_cached_token["value"]) and now < _cached_token["expires_at"] - 60
 
 
+def _recent_failure(now: float) -> str | None:
+    if _last_failure["error"] and now - _last_failure["at"] < _FAILURE_COOLDOWN:
+        return _last_failure["error"]
+    return None
+
+
 def get_access_token() -> str:
     """Return a valid Zoho access token, refreshing it if needed."""
     now = time.time()
     if _fresh(now):
         return _cached_token["value"]
+    if (err := _recent_failure(now)):
+        raise ZohoAuthError(err)
 
     with _refresh_lock:
-        # Another thread may have refreshed it while we waited for the lock.
+        # Another thread may have refreshed (or failed) while we waited for the lock.
         now = time.time()
         if _fresh(now):
             return _cached_token["value"]
-        return _refresh(now)
+        if (err := _recent_failure(now)):
+            raise ZohoAuthError(err)
+        try:
+            token = _refresh(now)
+        except ZohoAuthError as e:
+            _last_failure.update(error=str(e), at=time.time())
+            raise
+        _last_failure.update(error=None, at=0.0)
+        return token
 
 
 def _refresh(now: float) -> str:
@@ -58,7 +82,7 @@ def _refresh(now: float) -> str:
                 "client_secret": config.ZOHO_CLIENT_SECRET,
                 "grant_type": "refresh_token",
             },
-            timeout=30,
+            timeout=(10, 20),   # connect, read: fail fast instead of tying up a web thread
         )
     except requests.exceptions.RequestException as e:
         raise ZohoAuthError(f"Could not reach Zoho accounts server ({config.TOKEN_URL}): {e}")
