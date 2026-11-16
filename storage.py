@@ -209,6 +209,16 @@ def _conn():
             raise
 
 
+def change_counter() -> int:
+    """Rows changed through the shared connection since it opened. Goes up on
+    every write; db_backup uploads only when it moved."""
+    global _db
+    with _lock:
+        if _db is None:
+            _db = _open()
+        return _db.total_changes
+
+
 # Columns added after the first release - applied to existing databases.
 _MIGRATIONS = {
     "job_descriptions": {
@@ -231,6 +241,12 @@ _MIGRATIONS = {
         "duration_ms": "INTEGER",                   # wall time for this resume, download -> done
         "form_json": "TEXT",                        # matched Google Form response (answers)
         "file_added_ms": "INTEGER",                 # when the resume landed in WorkDrive (applications chart)
+    },
+    "form_invites": {
+        "folder_id": "TEXT",                        # WorkDrive folder the resume was filed in (date folder)
+        "phones": "TEXT NOT NULL DEFAULT '[]'",     # from the resume, to match the form by phone too
+        "form_filled_at": "TEXT",                   # set when their Google Form response appears
+        "form_json": "TEXT",                        # the matched response (answers)
     },
 }
 
@@ -422,10 +438,19 @@ def mark_interrupted_runs() -> int:
     """Runs left 'running' by a previous process can never finish - the thread
     died with it. Close them out so the folder isn't locked forever."""
     with _conn() as c:
+        ts = now()
+        # Their unfinished resumes too, or they'd show "Screening…" forever
+        # (the database now survives restarts via the MongoDB backup).
+        c.execute(
+            "UPDATE screenings SET stage = 'done', outcome = 'failed', "
+            "error = 'Interrupted: the server restarted mid-run. Screen it again.', updated_at = ? "
+            "WHERE stage != 'done' AND run_id IN (SELECT id FROM runs WHERE status IN ('running', 'cancelling'))",
+            (ts,),
+        )
         cur = c.execute(
             "UPDATE runs SET status = 'failed', error = 'Interrupted: the server restarted mid-run.', "
-            "finished_at = ? WHERE status = 'running'",
-            (now(),),
+            "finished_at = ? WHERE status IN ('running', 'cancelling')",
+            (ts,),
         )
         return cur.rowcount
 
@@ -690,21 +715,45 @@ def mark_email_fetched(message_id: str, position: str, candidate: str, file_name
 def _decode_invite(r) -> dict:
     d = dict(r)
     d["other_emails"] = json.loads(d.get("other_emails") or "[]")
+    d["phones"] = json.loads(d.get("phones") or "[]")
+    d["form"] = json.loads(d.pop("form_json") or "null")
     return d
 
 
 def add_invite(*, file_id, file_name, role_folder_id, role_name, candidate, email, email_source,
-               other_emails, applied_at) -> int | None:
+               other_emails, applied_at, folder_id=None, phones=None) -> int | None:
     """One row per fetched resume; a second fetch of the same file is ignored."""
     with _conn() as c:
         cur = c.execute(
             """INSERT OR IGNORE INTO form_invites (file_id, file_name, role_folder_id, role_name, candidate,
-                   email, email_source, other_emails, status, applied_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   email, email_source, other_emails, status, applied_at, created_at, folder_id, phones)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (file_id, file_name, role_folder_id, role_name, candidate, email or None, email_source or None,
-             json.dumps(other_emails or []), "ready" if email else "no_email", applied_at, now()),
+             json.dumps(other_emails or []), "ready" if email else "no_email", applied_at, now(),
+             folder_id, json.dumps(phones or [])),
         )
         return cur.lastrowid if cur.rowcount else None
+
+
+def get_invite_by_file(file_id: str):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM form_invites WHERE file_id = ?", (file_id,)).fetchone()
+        return _decode_invite(r) if r else None
+
+
+def invites_awaiting_form(role_folder_id: str) -> list:
+    """Invited applicants of a position whose form response hasn't been seen yet."""
+    with _conn() as c:
+        return [_decode_invite(r) for r in c.execute(
+            """SELECT * FROM form_invites WHERE role_folder_id = ? AND status IN ('sent', 'already_sent')
+                 AND form_filled_at IS NULL""", (role_folder_id,))]
+
+
+def mark_invite_filled(invite_id: int, response: dict) -> bool:
+    with _conn() as c:
+        return c.execute(
+            "UPDATE form_invites SET form_filled_at = ?, form_json = ? WHERE id = ? AND form_filled_at IS NULL",
+            (now(), json.dumps(response, ensure_ascii=False), invite_id)).rowcount > 0
 
 
 def get_invite(invite_id: int):
@@ -859,6 +908,16 @@ def add_walkin(*, file_id, role_folder_id, role_name, name, phone, email, notes)
             """INSERT OR REPLACE INTO walkins (file_id, role_folder_id, role_name, name, phone, email, notes, added_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (file_id, role_folder_id, role_name, name, phone or None, email or None, notes or None, now()))
+
+
+def list_walkins() -> list:
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM walkins ORDER BY added_at DESC")]
+
+
+def form_pending_by_file() -> dict:
+    with _conn() as c:
+        return {r["file_id"]: _decode_pending(r) for r in c.execute("SELECT * FROM form_pending")}
 
 
 def get_walkin(file_id: str):

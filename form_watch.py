@@ -121,10 +121,19 @@ def _reconcile(jd: dict) -> None:
 def _check_role(jd: dict) -> int:
     _reconcile(jd)
     waiting = [r for r in storage.list_form_pending(jd["role_folder_id"]) if not r["filled_at"]]
-    if not waiting:
+    invited = storage.invites_awaiting_form(jd["role_folder_id"])
+    if not waiting and not invited:
         return 0
     sheet = google_sheets.load(jd["form_sheet_url"], fresh=True)
     newly = 0
+    # Applicants who were sent the form: mark them ready to screen once they answer.
+    for inv in invited:
+        emails = [e for e in [inv["email"], *inv["other_emails"]] if e]
+        response = google_sheets.find_response(sheet, emails, inv["phones"])
+        if response and storage.mark_invite_filled(inv["id"], response):
+            newly += 1
+            storage.log("info", f"Google Form filled: {inv['candidate']} ({jd['role_name']}) - matched by "
+                                f"{response['matched_by']}. Ready to screen.")
     for r in waiting:
         response = google_sheets.find_response(sheet, r["emails"], r["phones"])
         if response and storage.mark_form_filled(r["file_id"]):

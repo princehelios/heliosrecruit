@@ -152,6 +152,12 @@ EMAIL_SUBJECT_FILTER = os.getenv("EMAIL_SUBJECT_FILTER", "New application for").
 # How many days back each fetch looks (already-fetched emails are skipped).
 EMAIL_LOOKBACK_DAYS = int(os.getenv("EMAIL_LOOKBACK_DAYS", "7"))
 
+# ---- MongoDB backup of screener.db (see db_backup.py) ----
+# Set MONGODB_URI (an Atlas mongodb+srv:// string) to keep the database across
+# Render free-plan redeploys. Empty = no backup, same as before.
+MONGODB_URI = _secret("MONGODB_URI")
+MONGODB_DB = os.getenv("MONGODB_DB", "resume_screener").strip() or "resume_screener"
+
 # ---- Google Form invites (sent to applicants after an email fetch) ----
 # Sent from EMAIL_ADDRESS through Gmail SMTP with the same App Password.
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()

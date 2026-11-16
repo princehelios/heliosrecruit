@@ -139,6 +139,29 @@ ek PDF/DOCX, ya printed resume ki photos (har page ki ek photo; phone pe camera 
 - Scanned / photo resumes (walk-in ya normal) ka text AI OCR se padha jaata hai (max 3 page,
   `OCR_MAX_PAGES`): ~₹0.3-0.5 per page, aur 1-2 minute lag sakte hain.
 
+### Naya simple flow: Home · Applicants · Positions
+
+Har applicant ek hi list me, har step pe ek button:
+
+**Gmail se fetch → Google Form bhejo → Form fill hua → Screen (manual) → Qualified / Not qualified**
+
+- **Home**: aaj kya karna hai (form bhejna, screen karna), applied → qualified funnel, aur position-wise table.
+- **Applicants**: tabs (New · Waiting for form · Form filled · Qualified · Not qualified), checkbox se select karke
+  ek button: *Send Google Form* ya *Screen*. Naam pe click → us applicant ki poori journey + score.
+- **Positions**: har position ek baar set karo: JD, Google Form link, response sheet, email text.
+- **+ Add applicant** = walk-in. Purane folder pages `#/files` pe abhi bhi hain (Positions → Browse files).
+- Form bhejne ke baad app response sheet har `FORM_CHECK_MINUTES` me check karta hai; jisne bhara wo
+  "Form filled" me aa jata hai. Screening manual hai.
+
+### Database MongoDB me safe (Render free plan)
+
+Render free plan pe har deploy pe `screener.db` ud jata tha. Ab `MONGODB_URI` set ho to poori database
+ki copy MongoDB Atlas me rehti hai (database `resume_screener`, GridFS): har 60 second me (agar kuch badla)
+aur shutdown pe. Naye deploy pe app start hote hi wahi copy wapas aa jati hai. Render pe:
+Environment → `MONGODB_URI` = Atlas ka `mongodb+srv://...` string. Atlas → Network Access me
+`0.0.0.0/0` allowed hona chahiye. Local pe `MONGODB_URI` khali rakho (ya alag copy banti hai,
+production kabhi overwrite nahi hota).
+
 ### Google Form invites (email se aaye applicants ko form bhejo)
 
 1. **Form sheets** page → har position pe **Add form link** → Google Form ka link

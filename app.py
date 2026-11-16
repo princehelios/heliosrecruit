@@ -22,7 +22,9 @@ from werkzeug.exceptions import HTTPException
 
 import activity
 import ai_scorer
+import applicants
 import config
+import db_backup
 import email_fetcher
 import forksafe
 import form_watch
@@ -49,6 +51,7 @@ app.config["MAX_CONTENT_LENGTH"] = 520 * 1024 * 1024
 # so a new build is picked up immediately instead of serving stale JS.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 31536000
 
+db_backup.restore()   # before the database opens: brings back the copy from MongoDB after a redeploy
 storage.init_db()
 _interrupted = storage.mark_interrupted_runs()
 if _interrupted:
@@ -149,6 +152,7 @@ def _start_background() -> None:
     in any process forked after import (see forksafe.py): threads never
     survive a fork, so without this the serving process ran with no form
     watcher, no keep-alive and no warm-up."""
+    db_backup.start()
     form_watch.start()
     keepalive.start()
     role_settings.start()   # refills position settings from WorkDrive after a redeploy
@@ -225,6 +229,7 @@ def api_status():
         "model": config.OPENAI_MODEL,
         "keepalive": keepalive.status(),
         "settings_restore": role_settings.status(),
+        "db_backup": db_backup.status(),
         "zoho_connected": False,
         "scopes": [],
         "recruit_schema": None,
@@ -393,6 +398,7 @@ def api_roles():
     for f in zoho_workdrive.list_children(config.WORKDRIVE_ROOT_FOLDER_ID, cached=True)["folders"]:
         jd = jds.get(f["id"]) or {}
         roles.append({"id": f["id"], "name": f["name"], "has_jd": bool((jd.get("jd_text") or "").strip()),
+                      "modified": f.get("modified"),
                       "form_sheet_url": jd.get("form_sheet_url") or "", "form_url": jd.get("form_url") or "",
                       "custom_template": bool(jd.get("invite_subject") or jd.get("invite_body"))})
     roles.sort(key=lambda r: r["name"].lower())
@@ -682,6 +688,68 @@ def api_add_walkin():
         warning = f"Saved, but not scored yet: {e}"
     return jsonify({"file_id": up["id"], "name": up["name"], "folder_id": folder_id,
                     "run_id": run_id, "warning": warning}), 201
+
+
+# ---------------------------------------------------------------- applicants (Home + Applicants pages)
+
+@app.get("/api/home")
+def api_home():
+    return jsonify(applicants.home(request.args.get("range") or "7"))
+
+
+@app.get("/api/applicants")
+def api_applicants():
+    rows = applicants.all_applicants(include_dismissed=request.args.get("tab") == "dismissed")
+    if request.args.get("tab") == "dismissed":
+        rows = [a for a in rows if a["dismissed"]]
+    role = request.args.get("role") or ""
+    if role:
+        rows = [a for a in rows if a["role_id"] == role]
+    rows = applicants.in_range(rows, request.args.get("range") or "all")
+    q = (request.args.get("q") or "").strip().lower()
+    if q:
+        rows = [a for a in rows if q in a["name"].lower() or q in (a["email"] or "").lower()]
+    counts = applicants.counts(rows)
+    tab = request.args.get("tab") or "all"
+    if tab in applicants.TABS:
+        rows = [a for a in rows if a["step"] in applicants.TABS[tab]]
+    jds = storage.list_jds()
+    roles = sorted({(a["role_id"], a["position"]) for a in applicants.all_applicants()}, key=lambda r: r[1].lower())
+    return jsonify({"items": rows, "counts": counts,
+                    "roles": [{"id": i, "name": n, "form_url": (jds.get(i) or {}).get("form_url") or "",
+                               "has_jd": bool(((jds.get(i) or {}).get("jd_text") or "").strip())} for i, n in roles],
+                    "queue": applicants.queue_status(), "sender": mailer.status(),
+                    "from": f"{config.EMAIL_FROM_NAME} <{config.EMAIL_ADDRESS}>"})
+
+
+@app.get("/api/applicants/<file_id>")
+def api_applicant(file_id):
+    a = applicants.detail(file_id)
+    if not a:
+        return _error("Applicant not found.", 404)
+    return jsonify(a)
+
+
+@app.post("/api/applicants/send-form")
+def api_applicants_send_form():
+    body = request.get_json(force=True, silent=True) or {}
+    wanted = set(body.get("ids") or [])
+    ids = [a["invite_id"] for a in applicants.all_applicants() if a["id"] in wanted and a["invite_id"]]
+    if not ids:
+        return _error("Select applicants who haven't been sent the form yet.", 400)
+    return jsonify(mailer.send_invites(ids))
+
+
+@app.post("/api/applicants/screen")
+def api_applicants_screen():
+    body = request.get_json(force=True, silent=True) or {}
+    return jsonify(applicants.screen(list(body.get("ids") or [])))
+
+
+@app.get("/api/applicants/progress")
+def api_applicants_progress():
+    return jsonify({"queue": applicants.queue_status(), "sender": mailer.status(),
+                    "fetch": {k: v for k, v in email_fetcher.status().items() if k != "results"}})
 
 
 # ---------------------------------------------------------------- Google Form invites

@@ -63,6 +63,13 @@ services:
         value: helios.cvtechlabs@gmail.com
       - key: EMAIL_APP_PASSWORD
         sync: false
+      # MongoDB Atlas keeps screener.db across free-plan redeploys (db_backup.py).
+      # Paste the mongodb+srv:// string in the dashboard; Atlas Network Access
+      # must allow 0.0.0.0/0 because Render's free outbound IPs change.
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: resume_screener
       - key: EMAIL_FROM_NAME
         value: Hiring Team   # sender name on the Google Form invites
       - key: FORM_CHECK_MINUTES
