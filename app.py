@@ -51,14 +51,6 @@ app.config["MAX_CONTENT_LENGTH"] = 520 * 1024 * 1024
 # so a new build is picked up immediately instead of serving stale JS.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 31536000
 
-db_backup.restore()   # before the database opens: brings back the copy from MongoDB after a redeploy
-storage.init_db()
-_interrupted = storage.mark_interrupted_runs()
-if _interrupted:
-    print(f"Marked {_interrupted} interrupted run(s) from a previous server session as failed.")
-_stuck = storage.reset_stuck_invites()
-if _stuck:
-    print(f"Put {_stuck} form invite(s) interrupted mid-send back to 'ready'.")
 
 
 # ------------------------------------------------- static assets & transfer
@@ -148,10 +140,7 @@ def _warm_cache():
 
 
 def _start_background() -> None:
-    """Every background thread the app runs. Called once at import and again
-    in any process forked after import (see forksafe.py): threads never
-    survive a fork, so without this the serving process ran with no form
-    watcher, no keep-alive and no warm-up."""
+    """Every background thread the app runs."""
     db_backup.start()
     form_watch.start()
     keepalive.start()
@@ -159,9 +148,57 @@ def _start_background() -> None:
     threading.Thread(target=_warm_cache, name="wd-warm", daemon=True).start()
 
 
-_start_background()
-# Registered after every module's reset hook, so it runs once they're done.
-forksafe.after_fork(_start_background)
+# ------------------------------------------------- start-up (per serving process)
+# Importing this module does NOTHING that touches the network, starts a thread
+# or opens the database. On Render the module was imported in one process and
+# the serving process was forked from it; anything running at that instant
+# (a thread mid DNS lookup, mid token refresh) left a lock held forever in the
+# copy, and every Zoho call hung. Now all start-up work runs in the process
+# that serves requests: gunicorn.conf.py calls ensure_started() right after the
+# worker boots, and the first request does it too if that hook didn't run.
+
+_startup_lock = threading.Lock()
+_started_pid: int | None = None
+
+
+@forksafe.after_fork
+def _reset_startup_after_fork() -> None:
+    global _startup_lock
+    _startup_lock = threading.Lock()
+
+
+def ensure_started() -> None:
+    """Restore the database copy, open the database and start the background
+    threads - once per process."""
+    global _started_pid
+    if _started_pid == os.getpid():
+        return
+    with _startup_lock:
+        if _started_pid == os.getpid():
+            return
+        db_backup.restore()   # before the database opens: brings back the copy from MongoDB after a redeploy
+        storage.init_db()
+        interrupted = storage.mark_interrupted_runs()
+        if interrupted:
+            print(f"Marked {interrupted} interrupted run(s) from a previous server session as failed.")
+        stuck = storage.reset_stuck_invites()
+        if stuck:
+            print(f"Put {stuck} form invite(s) interrupted mid-send back to 'ready'.")
+        _start_background()
+        _started_pid = os.getpid()
+        print(f"Start-up done in process {_started_pid}.")
+
+
+@app.before_request
+def _boot_if_needed():
+    if _started_pid == os.getpid():
+        return None
+    if request.path == "/healthz":
+        # Never make the health check wait on start-up (Mongo restore etc.).
+        threading.Thread(target=ensure_started, name="startup", daemon=True).start()
+        return None
+    ensure_started()
+    return None
 
 REQUIRED_SCOPES = {
     "WorkDrive.files.READ": "Browse folders and download resumes",
@@ -897,4 +934,5 @@ if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
     # use_reloader=False: the reloader runs the app twice, and a restart would
     # kill an in-progress screening run mid-way.
+    ensure_started()
     app.run(host=host, debug=debug, port=port, use_reloader=False, threaded=True)

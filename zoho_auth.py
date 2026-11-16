@@ -29,6 +29,8 @@ _last_failure = {"error": None, "at": 0.0}
 # Longest a caller waits for another thread's refresh. A refresh is bounded
 # (~35 s worst case), so hitting this means the lock is stuck, not busy.
 _LOCK_WAIT = 45
+# Who holds _refresh_lock and since when, so a stuck refresh names its culprit.
+_holder = {"thread": None, "since": 0.0}
 
 
 @forksafe.after_fork
@@ -61,8 +63,11 @@ def get_access_token() -> str:
 
     lock = _refresh_lock
     if not lock.acquire(timeout=_LOCK_WAIT):
-        raise ZohoAuthError(f"Timed out after {_LOCK_WAIT}s waiting for the Zoho token refresh. "
+        held = time.time() - _holder["since"] if _holder["since"] else 0
+        raise ZohoAuthError(f"Timed out after {_LOCK_WAIT}s waiting for the Zoho token refresh "
+                            f"(held by thread '{_holder['thread']}' for {held:.0f}s). "
                             "Try again; if it keeps happening, restart the service.")
+    _holder.update(thread=threading.current_thread().name, since=time.time())
     try:
         # Another thread may have refreshed (or failed) while we waited for the lock.
         now = time.time()
@@ -78,6 +83,7 @@ def get_access_token() -> str:
         _last_failure.update(error=None, at=0.0)
         return token
     finally:
+        _holder.update(thread=None, since=0.0)
         lock.release()
 
 

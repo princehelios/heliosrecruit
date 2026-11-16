@@ -73,13 +73,16 @@ def _db():
     if _client is None:
         from pymongo import MongoClient   # imported lazily: only needed when enabled
         kwargs = {}
-        try:
-            # python.org builds on macOS ship without CA certificates, so Atlas's
-            # TLS check fails locally; certifi (a requests dependency) has them.
-            import certifi
-            kwargs["tlsCAFile"] = certifi.where()
-        except ImportError:
-            pass
+        uri = config.MONGODB_URI.lower()
+        if uri.startswith("mongodb+srv://") or "tls=true" in uri or "ssl=true" in uri:
+            try:
+                # python.org builds on macOS ship without CA certificates, so Atlas's
+                # TLS check fails locally; certifi (a requests dependency) has them.
+                # Only for TLS connections: passing it turns TLS on.
+                import certifi
+                kwargs["tlsCAFile"] = certifi.where()
+            except ImportError:
+                pass
         _client = MongoClient(config.MONGODB_URI, serverSelectionTimeoutMS=15000,
                               connectTimeoutMS=15000, socketTimeoutMS=60000, appname="resume-screener", **kwargs)
     return _client[config.MONGODB_DB]
