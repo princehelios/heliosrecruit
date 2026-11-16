@@ -805,6 +805,20 @@ def api_notifications_seen():
     return jsonify({"ok": True})
 
 
+@app.get("/api/debug/threads")
+def api_debug_threads():
+    """TEMPORARY: where every thread is right now (code locations only), to
+    find what /api/status waits on in production. Remove once diagnosed."""
+    import sys
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = []
+    for ident, frame in sys._current_frames().items():
+        stack = traceback.extract_stack(frame)[-12:]
+        out.append(f"--- {names.get(ident, ident)}\n" + "".join(
+            f"  {os.path.basename(f.filename)}:{f.lineno} {f.name}  | {(f.line or '').strip()[:110]}\n" for f in stack))
+    return "\n".join(sorted(out)), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 @app.get("/api/events")
 def api_events():
     return jsonify({"events": storage.events(limit=int(request.args.get("limit", 300)))})
