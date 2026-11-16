@@ -80,7 +80,7 @@ def all_applicants(include_dismissed: bool = False) -> list[dict]:
     for i in invites:
         if i["status"] == "dismissed" and not include_dismissed:
             continue
-        a = {"id": i["file_id"], "invite_id": i["id"], "source": "gmail", "name": i["candidate"],
+        a = {"id": i["file_id"], "invite_id": i["id"], "source": i.get("source") or "gmail", "name": i["candidate"],
              "email": i["email"] or "", "email_source": i["email_source"] or "", "other_emails": i["other_emails"],
              "position": i["role_name"], "role_id": i["role_folder_id"], "file_name": i["file_name"],
              "folder_id": i.get("folder_id"), "applied_at": i["applied_at"] or i["created_at"],
@@ -141,7 +141,7 @@ def counts(rows: list[dict]) -> dict:
 def home(range_key: str = "7") -> dict:
     everyone = all_applicants()
     rows = in_range(everyone, range_key)
-    gmail = [a for a in rows if a["source"] == "gmail"]
+    gmail = [a for a in rows if a["source"] != "walkin"]   # Gmail + uploaded: both go through the form
     screened = [a for a in rows if a["step"] in ("qualified", "not_qualified")]
     qualified = [a for a in gmail if a["step"] == "qualified"]   # High/Medium split of the funnel's Qualified
     funnel = {

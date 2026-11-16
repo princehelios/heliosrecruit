@@ -145,6 +145,13 @@ CREATE TABLE IF NOT EXISTS form_invites (
 );
 
 CREATE INDEX IF NOT EXISTS idx_invites_status ON form_invites(status);
+
+-- Settings changed from the app (e.g. the sender email). Env vars are the defaults.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -247,6 +254,7 @@ _MIGRATIONS = {
         "phones": "TEXT NOT NULL DEFAULT '[]'",     # from the resume, to match the form by phone too
         "form_filled_at": "TEXT",                   # set when their Google Form response appears
         "form_json": "TEXT",                        # the matched response (answers)
+        "source": "TEXT NOT NULL DEFAULT 'gmail'",  # gmail | upload
     },
 }
 
@@ -721,18 +729,34 @@ def _decode_invite(r) -> dict:
 
 
 def add_invite(*, file_id, file_name, role_folder_id, role_name, candidate, email, email_source,
-               other_emails, applied_at, folder_id=None, phones=None) -> int | None:
-    """One row per fetched resume; a second fetch of the same file is ignored."""
+               other_emails, applied_at, folder_id=None, phones=None, source="gmail") -> int | None:
+    """One row per fetched or uploaded resume; the same file again is ignored."""
     with _conn() as c:
         cur = c.execute(
             """INSERT OR IGNORE INTO form_invites (file_id, file_name, role_folder_id, role_name, candidate,
-                   email, email_source, other_emails, status, applied_at, created_at, folder_id, phones)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   email, email_source, other_emails, status, applied_at, created_at, folder_id, phones, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (file_id, file_name, role_folder_id, role_name, candidate, email or None, email_source or None,
              json.dumps(other_emails or []), "ready" if email else "no_email", applied_at, now(),
-             folder_id, json.dumps(phones or [])),
+             folder_id, json.dumps(phones or []), source),
         )
         return cur.lastrowid if cur.rowcount else None
+
+
+def get_setting(key: str, default=None):
+    with _conn() as c:
+        r = c.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return r["value"] if r and r["value"] is not None else default
+
+
+def set_setting(key: str, value) -> None:
+    with _conn() as c:
+        if value is None or value == "":
+            c.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+        else:
+            c.execute("INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                      (key, str(value), now()))
 
 
 def get_invite_by_file(file_id: str):

@@ -197,6 +197,7 @@ async function route() {
   let m;
   const nav = (hash === "#/" || hash.startsWith("#/home")) ? "home"
     : hash.startsWith("#/applicant") ? "applicants" : hash.startsWith("#/positions") ? "positions"
+    : hash.startsWith("#/settings") ? "settings"
     : hash.startsWith("#/dashboard") ? "dashboard" : hash.startsWith("#/candidates") ? "candidates"
     : hash.startsWith("#/pending") ? "pending" : hash.startsWith("#/sheets") ? "sheets"
     : hash.startsWith("#/invites") ? "invites"
@@ -208,6 +209,7 @@ async function route() {
   if ((m = hash.match(/^#\/applicant\/([^?]+)/))) return renderApplicant(view, decodeURIComponent(m[1]));
   if (nav === "applicants") return renderApplicants(view);
   if (nav === "positions") return renderPositions(view);
+  if (nav === "settings") return renderSettings(view);
   if (nav === "dashboard") return renderDashboard(view);
   if (nav === "candidates") return renderCandidates(view);
   if (nav === "pending") return renderPending(view);
@@ -2497,12 +2499,13 @@ async function renderHome(view, { quiet = false } = {}) {
         <h1>${t.send + t.no_email + t.screen ? "Here's what needs you today." : "You're all caught up."}</h1></div>
       <div class="head-actions">
         <select id="home-range" aria-label="Date range">${RANGES.map(([v, l]) => `<option value="${v}" ${v === range ? "selected" : ""}>${l}</option>`).join("")}</select>
-        <button class="btn" id="add-applicant">+ Add applicant</button>
+        <button class="btn" id="add-applicant">+ Add walk-in</button>
+        <button class="btn" id="upload-resumes">Upload resumes</button>
         <button class="btn primary" id="fetch-emails">Fetch new from Gmail</button></div></div>
     <div class="stack">
       <div id="home-progress"></div>
       <section class="todo-grid" aria-label="To do">
-        <div class="todo-card"><div class="todo-top"><span class="todo-num blue">1</span>New from Gmail</div>
+        <div class="todo-card"><div class="todo-top"><span class="todo-num blue">1</span>New applicants</div>
           <div class="todo-big">${t.send + t.no_email} <span>applicants</span></div>
           <div class="todo-text">${t.send + t.no_email ? `Haven't got the Google Form yet.${t.no_email ? ` ${t.no_email} have no email - add it first.` : ""}${t.send_blocked ? ` ${t.send_blocked} are for positions without a form link.` : ""}` : "Everyone has been sent the form."}</div>
           <a class="btn ${t.send ? "primary" : ""}" href="#/applicants?tab=new">${t.send ? `Review & send form (${t.send})` : "Open"}</a></div>
@@ -2512,12 +2515,12 @@ async function renderHome(view, { quiet = false } = {}) {
             ${t.waiting ? `<br>${t.waiting} still haven't filled the form.` : ""}</div>
           <a class="btn ${t.screen ? "primary" : ""}" href="#/applicants?tab=filled">${t.screen ? `Review & screen (${t.screen})` : "Open"}</a></div>
         <div class="todo-card"><div class="todo-top"><span class="todo-num green">3</span>Qualified (${esc(RANGES.find(r => r[0] === range)?.[1].toLowerCase() || "")})</div>
-          <div class="todo-big">${f.qualified} <span>from Gmail</span></div>
+          <div class="todo-big">${f.qualified} <span>applicants</span></div>
           <div class="todo-text">${f.high} High · ${f.medium} Medium · ${f.in_recruit} in Zoho Recruit${f.walkins ? ` · ${f.walkins} walk-in(s)` : ""}</div>
           <a class="btn" href="#/applicants?tab=qualified">See qualified</a></div>
       </section>
 
-      <section class="card"><div class="card-head"><h2>From applied to qualified</h2><span class="muted small">Gmail applicants, ${esc(RANGES.find(r => r[0] === range)?.[1].toLowerCase() || "")}</span></div>
+      <section class="card"><div class="card-head"><h2>From applied to qualified</h2><span class="muted small">Gmail + uploaded applicants, ${esc(RANGES.find(r => r[0] === range)?.[1].toLowerCase() || "")}</span></div>
         <div class="card-body">${f.applied ? `<div class="funnel">
           ${bar("Applied", f.applied, f.applied, "")}
           ${bar("Form sent", f.form_sent, f.applied, `${pct(f.form_sent, f.applied)}%`)}
@@ -2548,6 +2551,7 @@ async function renderHome(view, { quiet = false } = {}) {
 
   $("#home-range").addEventListener("change", e => { prefSet("home-range", e.target.value); location.hash = `#/home?range=${e.target.value}`; });
   $("#add-applicant").addEventListener("click", () => walkinDialog());
+  $("#upload-resumes").addEventListener("click", () => uploadDialog());
   $("#fetch-emails").addEventListener("click", () => fetchEmails({}));
   watchProgress(view, renderHome);
 }
@@ -2616,8 +2620,9 @@ async function renderApplicants(view, { quiet = false } = {}) {
 
   view.innerHTML = `
     <div class="page-head"><div><h1>Applicants</h1>
-      <div class="sub">Everyone from Gmail and walk-ins, in one list. Each step has one button.</div></div>
-      <div class="head-actions"><button class="btn" id="add-applicant">+ Add applicant</button>
+      <div class="sub">Everyone from Gmail, uploads and walk-ins, in one list. Each step has one button.</div></div>
+      <div class="head-actions"><button class="btn" id="add-applicant">+ Add walk-in</button>
+        <button class="btn" id="upload-resumes">Upload resumes</button>
         <button class="btn primary" id="fetch-emails">Fetch new from Gmail</button></div></div>
     <div class="stack">
       <div id="ap-progress"></div>
@@ -2635,7 +2640,7 @@ async function renderApplicants(view, { quiet = false } = {}) {
           <th>Applicant</th><th>Position</th><th>Step</th><th>Applied</th><th class="right">Next</th></tr></thead>
         <tbody>${d.items.map(a => `<tr class="${ap.selected.has(a.id) ? "selected" : ""}">
           <td class="check">${pickable(a) ? `<input type="checkbox" data-pick="${esc(a.id)}" ${ap.selected.has(a.id) ? "checked" : ""} aria-label="Select ${esc(a.name)}">` : ""}</td>
-          <td><a class="primary-text" href="#/applicant/${esc(a.id)}">${esc(a.name)}</a>${a.source === "walkin" ? ` <span class="tag">Walk-in</span>` : ""}<div>${emailCell(a)}</div></td>
+          <td><a class="primary-text" href="#/applicant/${esc(a.id)}">${esc(a.name)}</a>${a.source === "walkin" ? ` <span class="tag">Walk-in</span>` : a.source === "upload" ? ` <span class="tag">Uploaded</span>` : ""}<div>${emailCell(a)}</div></td>
           <td class="small">${esc(a.position)}</td>
           <td>${stepPill(a)}<div class="secondary-text">${esc(stepNote(a))}</div></td>
           <td class="muted small nowrap">${esc(shortDate(a.applied_at))}</td>
@@ -2670,6 +2675,7 @@ async function renderApplicants(view, { quiet = false } = {}) {
   $("#ap-q").addEventListener("input", e => { clearTimeout(qTimer); qTimer = setTimeout(() => { ap.q = e.target.value.trim(); go(); }, 300); });
   $("#ap-dismissed").addEventListener("click", e => { e.preventDefault(); ap.tab = "dismissed"; go(); });
   $("#add-applicant").addEventListener("click", () => walkinDialog(ap.role || undefined));
+  $("#upload-resumes").addEventListener("click", () => uploadDialog(ap.role || ""));
   $("#fetch-emails").addEventListener("click", () => fetchEmails({}));
   $$("[data-pick]", view).forEach(cb => cb.addEventListener("change", () => { cb.checked ? ap.selected.add(cb.dataset.pick) : ap.selected.delete(cb.dataset.pick); renderBulk(); }));
   $("#ap-all")?.addEventListener("change", e => { $$("[data-pick]", view).forEach(x => { x.checked = e.target.checked; e.target.checked ? ap.selected.add(x.dataset.pick) : ap.selected.delete(x.dataset.pick); }); renderBulk(); });
@@ -2708,7 +2714,7 @@ async function renderApplicant(view, id) {
     done(true, "Added as walk-in", a.applied_at, "by HR"),
     done(screened, screened ? `Screened: ${a.band || ""} ${a.score != null ? Math.round(a.score) : ""}` : "Screening", a.screened_at, "resume + HR notes"),
   ] : [
-    done(true, "Applied", a.applied_at, "resume fetched from Gmail"),
+    done(true, a.source === "upload" ? "Resume uploaded" : "Applied", a.applied_at, a.source === "upload" ? "uploaded from the app" : "resume fetched from Gmail"),
     done(!!a.sent_at || ["sent", "filled", "screening", "qualified", "not_qualified"].includes(a.step), "Google Form sent", a.sent_at, a.email),
     done(!!a.form_filled_at, a.form_filled_at ? "Form filled" : "Form not filled yet", a.form_filled_at, a.form?.matched_by ? `matched by ${a.form.matched_by}` : ""),
     done(screened, screened ? `Screened: ${a.band || ""} ${a.score != null ? Math.round(a.score) : ""}` : "Not screened yet", a.screened_at, ""),
@@ -2723,7 +2729,7 @@ async function renderApplicant(view, id) {
       <section class="card"><div class="card-body applicant-head">
         <div class="avatar" aria-hidden="true">${esc((a.name || "?").split(/\s+/).map(w => w[0]).slice(0, 2).join("").toUpperCase())}</div>
         <div style="flex:1 1 300px;min-width:0"><h1 style="margin:0">${esc(a.name)}</h1>
-          <div class="sub">${esc(a.position)} · ${a.source === "walkin" ? "walk-in" : "applied via Gmail"} ${esc(shortDate(a.applied_at))}</div>
+          <div class="sub">${esc(a.position)} · ${a.source === "walkin" ? "walk-in" : a.source === "upload" ? "uploaded" : "applied via Gmail"} ${esc(shortDate(a.applied_at))}</div>
           <div class="secondary-text">${esc(a.email || "no email")}</div></div>
         ${a.score != null ? `<div class="score-box ${a.band === "High" ? "hi" : a.band === "Medium" ? "mid" : "lo"}"><b>${Math.round(a.score)}</b><span>${esc(a.band)} · ${esc(a.step_label)}</span></div>` : `<div>${stepPill(a)}</div>`}
         <div class="head-actions">${a.file_name ? "" : ""}${next}</div>
@@ -2831,6 +2837,122 @@ async function positionEditor(role, onSaved) {
     if (errors.length) { errors.forEach(m => toast(m, "error")); btn.disabled = false; btn.textContent = "Save"; return; }
     toast(`${role.name} saved`, "success");
     onSaved();
+  });
+}
+
+/* ---------------------------------------------------------------- Upload resumes (date-wise) */
+
+const isoToday = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+const folderLabel = iso => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString("en-GB", { day: "numeric", month: "short" }); };
+
+async function uploadDialog(roleId = "") {
+  openModal(`<h2>Upload resumes</h2><div class="loading-block" style="padding:30px 0"><span class="spinner"></span> Loading positions…</div>`);
+  let roles;
+  try { roles = (await api("/api/roles")).roles; } catch (e) { closeModal(); return toast(e.message, "error"); }
+  if (!roles.length) { closeModal(); return toast("No positions yet - create a position folder first (Positions → Browse files).", "error"); }
+  openModal(`
+    <h2>Upload resumes</h2>
+    <p class="muted small">Each resume is saved in WorkDrive under the position and date you pick, and becomes an applicant
+      (email read from the resume), ready for <b>Send form → Screen</b>.</p>
+    <div class="field"><label for="up-role">Position</label>
+      <select id="up-role">${roles.map(r => `<option value="${esc(r.id)}" ${r.id === roleId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></div>
+    <div class="field"><label for="up-date">Date</label>
+      <input type="date" id="up-date" value="${isoToday()}" max="${isoToday()}"></div>
+    <div class="field"><label for="up-files">Resumes (.pdf or .docx, up to 50)</label>
+      <input type="file" id="up-files" multiple accept=".pdf,.docx"></div>
+    <div class="callout info" id="up-where"><div></div></div>
+    <div id="up-status" class="muted small" aria-live="polite"></div>
+    <div class="modal-actions"><button class="btn" data-close>Cancel</button><button class="btn primary" id="up-go" disabled>Upload</button></div>`);
+  const where = () => {
+    const r = roles.find(x => x.id === $("#up-role").value), date = $("#up-date").value || isoToday();
+    const n = $("#up-files").files.length;
+    $("#up-where div").innerHTML = `Saved to WorkDrive: <b>${esc(r?.name || "")} / ${esc(folderLabel(date))}</b>${n ? ` · ${plural(n, "file")} selected` : ""}`;
+    $("#up-go").disabled = !n;
+    $("#up-go").textContent = n ? `Upload ${plural(n, "resume")}` : "Upload";
+  };
+  ["#up-role", "#up-date", "#up-files"].forEach(sel => $(sel).addEventListener("change", where));
+  where();
+  $("#up-go").addEventListener("click", async () => {
+    const files = [...$("#up-files").files];
+    if (files.length > 50) return toast("Upload at most 50 resumes at a time.", "error");
+    const btn = $("#up-go"), st = $("#up-status");
+    btn.disabled = true;
+    let ok = 0, noEmail = 0;
+    const failed = [];
+    for (let i = 0; i < files.length; i += UPLOAD_BATCH) {
+      const batch = files.slice(i, i + UPLOAD_BATCH);
+      st.innerHTML = `<span class="spinner"></span> Uploading ${Math.min(i + batch.length, files.length)} of ${files.length}…`;
+      const form = new FormData();
+      form.append("role_id", $("#up-role").value);
+      form.append("date", $("#up-date").value || isoToday());
+      batch.forEach(f => form.append("files", f));
+      try {
+        const r = await api("/api/applicants/upload", { method: "POST", body: form });
+        r.results.forEach(x => { if (x.ok) { ok++; if (!x.email) noEmail++; } else failed.push(`${x.name}: ${x.error}`); });
+      } catch (e) { batch.forEach(f => failed.push(`${f.name}: ${e.message}`)); }
+    }
+    closeModal();
+    if (ok) toast(`${plural(ok, "resume")} uploaded and added to Applicants${noEmail ? ` (${noEmail} without an email - add it there)` : ""}`, "success");
+    failed.slice(0, 5).forEach(m => toast(m, "error"));
+    loadApplicantsBadge();
+    if (ok && !location.hash.startsWith("#/applicants")) location.hash = "#/applicants?tab=new";
+    else route();
+  });
+}
+
+/* ---------------------------------------------------------------- Settings: sender email */
+
+async function renderSettings(view) {
+  loading(view);
+  let s;
+  try { s = await api("/api/settings/email"); } catch (e) { return errorView(view, e.message); }
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Settings</h1><div class="sub">Who the Google Form emails come from.</div></div></div>
+    <div class="stack">
+      <section class="card"><div class="card-head"><h2>Sender email</h2>
+          <span class="tag ${s.custom ? "blue" : ""}">${s.custom ? "Custom sender" : "Default sender"}</span></div>
+        <div class="card-body" style="max-width:640px">
+          <p class="muted small" style="margin-top:0">Applicants see this as the "From" of the Google Form email. Gmail only sends from an
+            account it can log into, so a different address needs that account's <b>App Password</b>
+            (Google Account → Security → 2-Step Verification → App passwords). It's checked before saving.</p>
+          <div class="field"><label for="se-name">Sender name</label>
+            <input type="text" id="se-name" value="${esc(s.sender_name)}" placeholder="${esc(s.default_name)}"></div>
+          <div class="field"><label for="se-email">Sender email (Gmail or Google Workspace)</label>
+            <input type="email" id="se-email" value="${esc(s.sender_email)}" placeholder="${esc(s.default_email)}"></div>
+          <div class="field"><label for="se-pass">App Password for this email</label>
+            <input type="password" id="se-pass" autocomplete="new-password" placeholder="${s.custom && s.has_password ? "saved - leave empty to keep it" : "16 letters, e.g. abcd efgh ijkl mnop"}">
+            <span class="help">${s.custom ? "" : `Not needed for ${esc(s.default_email)} (already set on the server).`}</span></div>
+          <div class="field"><label for="se-reply">Replies go to (optional)</label>
+            <input type="email" id="se-reply" value="${esc(s.reply_to)}" placeholder="e.g. hr@yourcompany.com"></div>
+          <div class="callout info"><div>Fetching applications still reads the inbox <b>${esc(s.fetch_inbox)}</b>. This setting only changes who the invites are sent from.</div></div>
+        </div>
+        <div class="card-foot">
+          ${s.custom ? `<button class="btn" id="se-reset">Use default (${esc(s.default_email)})</button><span style="flex:1"></span>` : ""}
+          <button class="btn" id="se-test">Send a test to the sender</button>
+          <button class="btn primary" id="se-save">Save</button></div>
+      </section>
+    </div>`;
+  const busy = (b, on, label) => { b.disabled = on; b.innerHTML = on ? `<span class="spinner"></span> ${label}` : label; };
+  $("#se-save").addEventListener("click", async () => {
+    const b = $("#se-save"); busy(b, true, "Checking login…");
+    try {
+      const r = await api("/api/settings/email", { method: "PUT", body: {
+        sender_email: $("#se-email").value.trim() || s.default_email, sender_name: $("#se-name").value.trim(),
+        reply_to: $("#se-reply").value.trim(), app_password: $("#se-pass").value } });
+      toast(`Invites will be sent from ${r.sender_name} <${r.sender_email}>`, "success");
+      renderSettings(view);
+    } catch (e) { toast(e.message, "error"); busy(b, false, "Save"); }
+  });
+  $("#se-test").addEventListener("click", async () => {
+    const b = $("#se-test"); busy(b, true, "Sending…");
+    try { const r = await api("/api/settings/email/test", { method: "POST" }); toast(`Test email sent to ${r.sent_to}`, "success"); }
+    catch (e) { toast(e.message, "error"); }
+    busy(b, false, "Send a test to the sender");
+  });
+  $("#se-reset")?.addEventListener("click", async () => {
+    if (!confirm(`Send invites from ${s.default_email} again?`)) return;
+    try { await api("/api/settings/email", { method: "PUT", body: { reset: true } }); toast("Back to the default sender", "success"); renderSettings(view); }
+    catch (e) { toast(e.message, "error"); }
   });
 }
 

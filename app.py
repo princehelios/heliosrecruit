@@ -756,7 +756,7 @@ def api_applicants():
                     "roles": [{"id": i, "name": n, "form_url": (jds.get(i) or {}).get("form_url") or "",
                                "has_jd": bool(((jds.get(i) or {}).get("jd_text") or "").strip())} for i, n in roles],
                     "queue": applicants.queue_status(), "sender": mailer.status(),
-                    "from": f"{config.EMAIL_FROM_NAME} <{config.EMAIL_ADDRESS}>"})
+                    "from": mailer.sender_label()})
 
 
 @app.get("/api/applicants/<file_id>")
@@ -783,6 +783,113 @@ def api_applicants_screen():
     return jsonify(applicants.screen(list(body.get("ids") or [])))
 
 
+@app.post("/api/applicants/upload")
+def api_applicants_upload():
+    """Uploads resumes into ROOT / <position> / <date> (date folder created if
+    missing) and adds each as an applicant, email read from the resume, ready
+    for Send form -> Screen. The UI sends a few files per request."""
+    from datetime import datetime as _dt
+    role_id = (request.form.get("role_id") or "").strip()
+    path = zoho_workdrive.resolve_path(role_id) if role_id else []
+    if len(path) != 2:
+        return _error("Pick a position.", 400)
+    role = path[1]
+    raw_date = (request.form.get("date") or "").strip()
+    try:
+        when = _dt.strptime(raw_date, "%Y-%m-%d") if raw_date else _dt.now()
+    except ValueError:
+        return _error("Date must look like 2026-11-16.", 400)
+    files = request.files.getlist("files")
+    if not files:
+        return _error("Choose at least one resume (.pdf or .docx).", 400)
+    if len(files) > 50:
+        return _error("Upload at most 50 resumes at a time.", 400)
+    cache: dict = {}
+    folder_name = email_fetcher.date_label(when)
+    date_id, created = email_fetcher._find_or_create(role["id"], folder_name, cache)
+    results = []
+    for f in files:
+        name = os.path.basename(f.filename or "resume")
+        try:
+            content = f.read()
+            up = zoho_workdrive.upload_resume(date_id, name, content)
+            stem = re.sub(r"[_\-]+", " ", os.path.splitext(up["name"])[0])
+            stem = re.sub(r"\b(resume|cv|curriculum vitae|updated|final|new)\b", " ", stem, flags=re.I)
+            candidate = re.sub(r"[^\w .'-]", " ", stem)
+            candidate = re.sub(r"\s+", " ", candidate).strip().title() or "Candidate"
+            email = email_fetcher._queue_invite(
+                {"name": candidate, "position": role["name"], "when": when, "reply_to": ""},
+                {"file_id": up["id"], "file_name": up["name"], "role_folder_id": role["id"], "folder_id": date_id},
+                content, os.path.splitext(name)[1].lower(), origin="upload")
+            results.append({"name": up["name"], "id": up["id"], "ok": True, "email": email})
+        except WorkDriveError as e:
+            results.append({"name": name, "ok": False, "error": str(e)})
+    ok = [r for r in results if r["ok"]]
+    if ok:
+        storage.log("info", f"Uploaded {len(ok)} resume(s) to '{role['name']} / {folder_name}' from the app.")
+    return jsonify({"results": results, "uploaded": len(ok), "failed": len(results) - len(ok),
+                    "folder": f"{role['name']} / {folder_name}", "folder_created": created})
+
+
+@app.get("/api/settings/email")
+def api_get_email_settings():
+    snd = mailer.sender()
+    return jsonify({"sender_email": snd["address"], "sender_name": snd["name"], "reply_to": snd["reply_to"],
+                    "custom": snd["custom"], "has_password": bool(snd["password"]),
+                    "default_email": config.EMAIL_ADDRESS, "default_name": config.EMAIL_FROM_NAME,
+                    "fetch_inbox": config.EMAIL_ADDRESS})
+
+
+@app.put("/api/settings/email")
+def api_save_email_settings():
+    body = request.get_json(force=True, silent=True) or {}
+    if body.get("reset"):
+        for k in ("sender_email", "sender_app_password", "sender_name", "reply_to"):
+            storage.set_setting(k, None)
+        storage.log("info", f"Invite sender reset to the default ({config.EMAIL_ADDRESS}).")
+        return api_get_email_settings()
+    address = (body.get("sender_email") or "").strip().lower()
+    name = (body.get("sender_name") or "").strip()
+    reply_to = (body.get("reply_to") or "").strip().lower()
+    password = re.sub(r"\s+", "", body.get("app_password") or "").strip("'\"")
+    if not mailer.valid_email(address):
+        return _error("Enter a valid sender email address.", 400)
+    if reply_to and not mailer.valid_email(reply_to):
+        return _error("Reply-to must be a valid email address (or empty).", 400)
+    current = mailer.sender()
+    if address == config.EMAIL_ADDRESS.lower() and not password:
+        password_to_use = None          # back to the default account: no extra password needed
+    else:
+        password_to_use = password or (current["password"] if address == current["address"].lower() else "")
+        if not password_to_use:
+            return _error(f"Enter the Gmail App Password for {address} - Gmail only sends from an account it can log into.", 400)
+        mailer.check_login(address, password_to_use)
+    if password_to_use is None:
+        storage.set_setting("sender_email", None)
+        storage.set_setting("sender_app_password", None)
+    else:
+        storage.set_setting("sender_email", address)
+        storage.set_setting("sender_app_password", password_to_use)
+    storage.set_setting("sender_name", name or None)
+    storage.set_setting("reply_to", reply_to or None)
+    storage.log("info", f"Invite sender set to {mailer.sender_label()}" + (f", replies to {reply_to}" if reply_to else "") + ".")
+    return api_get_email_settings()
+
+
+@app.post("/api/settings/email/test")
+def api_test_email_settings():
+    snd = mailer.sender()
+    msg = mailer.build(snd["address"], "[TEST] Sender check from Resume Screener",
+                       f"This is a test from Resume Screener.\n\nGoogle Form invites will come from: {mailer.sender_label()}"
+                       + (f"\nReplies go to: {snd['reply_to']}" if snd["reply_to"] else ""), "test")
+    smtp = mailer._smtp()
+    try:
+        smtp.send_message(msg)
+    finally:
+        smtp.quit()
+    return jsonify({"sent_to": snd["address"]})
+
+
 @app.get("/api/applicants/progress")
 def api_applicants_progress():
     return jsonify({"queue": applicants.queue_status(), "sender": mailer.status(),
@@ -800,7 +907,7 @@ def api_get_invite_settings(role_folder_id):
     return jsonify({"form_url": jd.get("form_url") or "",
                     "invite_subject": jd.get("invite_subject") or "", "invite_body": jd.get("invite_body") or "",
                     "default_subject": config.DEFAULT_INVITE_SUBJECT, "default_body": config.DEFAULT_INVITE_BODY,
-                    "from": f"{config.EMAIL_FROM_NAME} <{config.EMAIL_ADDRESS}>"})
+                    "from": mailer.sender_label()})
 
 
 @app.put("/api/roles/<role_folder_id>/invite")
@@ -847,7 +954,7 @@ def api_invites():
             "form_url": (jds.get(r["role_folder_id"]) or {}).get("form_url") or "", "items": []})
         role["items"].append(r)
     return jsonify({"roles": sorted(roles.values(), key=lambda x: x["name"].lower()),
-                    "sender": mailer.status(), "from": f"{config.EMAIL_FROM_NAME} <{config.EMAIL_ADDRESS}>"})
+                    "sender": mailer.status(), "from": mailer.sender_label()})
 
 
 @app.post("/api/invites/send")

@@ -128,7 +128,7 @@ def _reply_to(msg) -> str:
     return addr
 
 
-def _queue_invite(job: dict, filed: dict, content: bytes, ext: str) -> str:
+def _queue_invite(job: dict, filed: dict, content: bytes, ext: str, origin: str = "gmail") -> str:
     """Adds the applicant to the Form invites review list (nothing is sent
     here). Email comes from the resume first, then the mail's Reply-To."""
     emails: list[str] = []
@@ -149,7 +149,7 @@ def _queue_invite(job: dict, filed: dict, content: bytes, ext: str) -> str:
                        role_folder_id=filed["role_folder_id"], role_name=job["position"],
                        candidate=job["name"], email=chosen, email_source=source,
                        other_emails=list(dict.fromkeys(others)), applied_at=job["when"].isoformat(),
-                       folder_id=filed.get("folder_id"), phones=phones)
+                       folder_id=filed.get("folder_id"), phones=phones, source=origin)
     return chosen
 
 

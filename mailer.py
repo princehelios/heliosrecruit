@@ -47,6 +47,45 @@ def status() -> dict:
     return dict(_state)
 
 
+# ---------------------------------------------------------------- sender (Settings page)
+
+def sender() -> dict:
+    """Who the invites come from. Set on the Settings page; until then the
+    env account (EMAIL_ADDRESS / EMAIL_APP_PASSWORD / EMAIL_FROM_NAME)."""
+    address = (storage.get_setting("sender_email") or "").strip()
+    custom = bool(address)
+    return {
+        "address": address if custom else config.EMAIL_ADDRESS,
+        "password": (storage.get_setting("sender_app_password") or "") if custom else config.EMAIL_APP_PASSWORD,
+        "name": (storage.get_setting("sender_name") or "").strip() or config.EMAIL_FROM_NAME,
+        "reply_to": (storage.get_setting("reply_to") or "").strip(),
+        "custom": custom,
+    }
+
+
+def sender_label() -> str:
+    s = sender()
+    return formataddr((s["name"], s["address"]))
+
+
+def check_login(address: str, password: str) -> None:
+    """Logs in to Gmail SMTP once; raises MailError with a clear reason."""
+    try:
+        s = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT, timeout=30)
+        try:
+            s.login(address, password)
+        finally:
+            try:
+                s.quit()
+            except Exception:
+                pass
+    except smtplib.SMTPAuthenticationError:
+        raise MailError(f"Gmail refused the login for {address}. Use a 16-letter App Password for that account "
+                        "(Google Account → Security → 2-Step Verification → App passwords), not the normal password.")
+    except (smtplib.SMTPException, OSError) as e:
+        raise MailError(f"Could not reach Gmail to check {address}: {e}")
+
+
 def valid_email(value: str) -> bool:
     return bool(_EMAIL_RE.match((value or "").strip()))
 
@@ -70,11 +109,14 @@ def template_for(jd: dict | None) -> tuple[str, str]:
 
 
 def build(to: str, subject: str, body: str, role_folder_id: str) -> EmailMessage:
+    s = sender()
     msg = EmailMessage()
-    msg["From"] = formataddr((config.EMAIL_FROM_NAME, config.EMAIL_ADDRESS))
+    msg["From"] = formataddr((s["name"], s["address"]))
     msg["To"] = to
+    if s["reply_to"]:
+        msg["Reply-To"] = s["reply_to"]
     msg["Subject"] = subject
-    msg["Message-ID"] = make_msgid(domain=config.EMAIL_ADDRESS.split("@")[-1])
+    msg["Message-ID"] = make_msgid(domain=s["address"].split("@")[-1])
     msg[INVITE_HEADER] = role_folder_id
     msg.set_content(body)
     return msg
@@ -83,14 +125,15 @@ def build(to: str, subject: str, body: str, role_folder_id: str) -> EmailMessage
 # ---------------------------------------------------------------- connections
 
 def _smtp() -> smtplib.SMTP_SSL:
-    if not config.EMAIL_APP_PASSWORD:
-        raise MailError(f"EMAIL_APP_PASSWORD is not set, so mail can't be sent from {config.EMAIL_ADDRESS}.")
+    snd = sender()
+    if not snd["password"]:
+        raise MailError(f"No app password saved for {snd['address']}, so mail can't be sent. Add it on the Settings page.")
     try:
         s = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT, timeout=30)
-        s.login(config.EMAIL_ADDRESS, config.EMAIL_APP_PASSWORD)
+        s.login(snd["address"], snd["password"])
         return s
     except (smtplib.SMTPException, OSError) as e:
-        raise MailError(f"Could not log in to Gmail to send as {config.EMAIL_ADDRESS}: {e}")
+        raise MailError(f"Could not log in to Gmail to send as {snd['address']}: {e}")
 
 
 def _sent_folder(imap) -> str:
@@ -110,14 +153,15 @@ class SentIndex:
     """Read-only look-ups in the Sent folder, one IMAP login per batch."""
 
     def __init__(self):
+        snd = sender()   # the Sent folder of the account the invites go out from
         try:
             self.imap = imaplib.IMAP4_SSL(config.EMAIL_IMAP_HOST, timeout=30)
-            self.imap.login(config.EMAIL_ADDRESS, config.EMAIL_APP_PASSWORD)
+            self.imap.login(snd["address"], snd["password"])
             typ, _ = self.imap.select(f'"{_sent_folder(self.imap)}"', readonly=True)
             if typ != "OK":
                 raise MailError("Could not open Gmail's Sent folder.")
         except (imaplib.IMAP4.error, OSError) as e:
-            raise MailError(f"Could not read the Sent folder of {config.EMAIL_ADDRESS} (checked so nobody is "
+            raise MailError(f"Could not read the Sent folder of {snd['address']} (checked so nobody is "
                             f"emailed twice): {e}")
         self.since = (datetime.now() - timedelta(days=config.INVITE_DEDUPE_DAYS)).strftime("%d-%b-%Y")
 
@@ -148,15 +192,16 @@ def send_test(role_folder_id: str, role_name: str, jd: dict | None) -> str:
     if not form_url:
         raise MailError("Add the Google Form link first.")
     subject, body = template_for(jd)
-    msg = build(config.EMAIL_ADDRESS, "[TEST] " + render(subject, name="Sample Applicant", position=role_name,
-                                                        form_link=form_url),
+    to = sender()["address"]
+    msg = build(to, "[TEST] " + render(subject, name="Sample Applicant", position=role_name,
+                                       form_link=form_url),
                 render(body, name="Sample Applicant", position=role_name, form_link=form_url), "test")
     s = _smtp()
     try:
         s.send_message(msg)
     finally:
         s.quit()
-    return config.EMAIL_ADDRESS
+    return to
 
 
 def send_invites(ids: list[int]) -> dict:
