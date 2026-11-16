@@ -556,10 +556,12 @@ async def _pipeline(jobs: list[dict], finish) -> None:
                         out = trip["error"] or await _download_tab(ctx, job["link"])
                     if isinstance(out, IndeedBlockedError):
                         trip["blocked"] += 1
-                        if trip["blocked"] >= 3 and not trip["ok"] and not trip["error"]:
+                        # The bot check is per server IP: one is proof, and its heavy page
+                        # can exhaust a 512 MB instance, so stop at the first.
+                        if not trip["ok"] and not trip["error"]:
                             trip["error"] = EmailFetchError(f"Skipped: Indeed is blocking this server. {out}")
-                            storage.log("warn", "Email fetch: Indeed blocked 3 resumes in a row - skipping the "
-                                                "rest of this run. They stay unfetched and are retried next time.")
+                            storage.log("warn", "Email fetch: Indeed is blocking this server with a bot check - "
+                                                "skipped the rest of this run. Those mails stay unfetched.")
                     elif not isinstance(out, Exception):
                         trip["ok"] += 1
                 await loop.run_in_executor(pool, finish, job, out)
