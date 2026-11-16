@@ -21,11 +21,21 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 import config
+import forksafe
 import storage
 
 INVITE_HEADER = "X-Screener-Invite"
 _send_lock = threading.Lock()
 _state = {"running": False, "total": 0, "done": 0, "sent": 0, "skipped": 0, "failed": 0, "error": None}
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _send_lock
+    _send_lock = threading.Lock()
+    _state["running"] = False
+
+
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 

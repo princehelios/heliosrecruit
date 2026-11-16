@@ -19,6 +19,7 @@ import os
 import threading
 import time
 
+import forksafe
 from http_client import SESSION
 
 # Comfortably inside Render's 15-minute idle window, with room for one missed
@@ -27,6 +28,12 @@ INTERVAL_SECONDS = int(os.getenv("KEEPALIVE_MINUTES", "10")) * 60
 
 _started = False
 _state = {"last_ping": None, "last_status": None, "ok": 0, "failed": 0, "url": None}
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _started
+    _started = False                 # pinger thread is gone in the child; app.py restarts it
 
 
 def target_url() -> str | None:

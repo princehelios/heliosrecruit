@@ -14,6 +14,8 @@ could create a duplicate candidate in Recruit or re-delete a file in WorkDrive,
 so those always fail fast and are handled by the caller instead.
 """
 import requests
+
+import forksafe
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -57,3 +59,12 @@ def _build() -> requests.Session:
 # requests.Session is safe to send from several threads at once; nothing here
 # mutates session-level headers or cookies after start-up.
 SESSION = _build()
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    # Pooled sockets (and their TLS state) must not be shared with the parent.
+    # Other modules hold a reference to SESSION, so swap its adapters in place.
+    fresh = _build()
+    for prefix, adapter in fresh.adapters.items():
+        SESSION.mount(prefix, adapter)

@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 import config
+import forksafe
 import google_sheets
 import storage
 import zoho_workdrive
@@ -113,6 +114,12 @@ _SHEET_FRESH = 120
 _sheet_cache: dict[str, tuple[float, tuple]] = {}
 _sheet_refreshing: set[str] = set()
 _sheet_lock = threading.Lock()
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _sheet_lock
+    _sheet_lock = threading.Lock()
 _sheet_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sheet-refresh")
 
 

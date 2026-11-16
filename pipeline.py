@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import ai_scorer
 import config
+import forksafe
 import email_fetcher
 import google_sheets
 import recruit_mapping
@@ -44,6 +45,12 @@ from zoho_workdrive import WorkDriveError
 MAX_PARALLEL_RESUMES = max(1, int(os.getenv("MAX_PARALLEL_RESUMES", "3")))
 
 _start_lock = threading.Lock()
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _start_lock
+    _start_lock = threading.Lock()
 
 
 class PipelineError(Exception):

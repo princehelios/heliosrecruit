@@ -11,6 +11,16 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def _secret(name: str, default: str = "") -> str:
+    """An env value with whitespace and wrapping quotes removed. Pasting
+    "abc" (with the quotes) into Render's dashboard stores the quotes too,
+    which silently breaks a password or token."""
+    value = (os.getenv(name) or default).strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -20,11 +30,11 @@ def _bool(name: str, default: bool) -> bool:
 
 ZOHO_DOMAIN = os.getenv("ZOHO_DOMAIN", "in").strip().lstrip(".")
 
-ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID", "").strip()
-ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET", "").strip()
-ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN", "").strip()
+ZOHO_CLIENT_ID = _secret("ZOHO_CLIENT_ID")
+ZOHO_CLIENT_SECRET = _secret("ZOHO_CLIENT_SECRET")
+ZOHO_REFRESH_TOKEN = _secret("ZOHO_REFRESH_TOKEN")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = _secret("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # ---- Token budget ----
@@ -136,7 +146,7 @@ RECRUIT_ATTACHMENT_CATEGORIES = ("Resume", "Others")
 # Security -> 2-Step Verification -> App passwords). The normal password won't work.
 EMAIL_IMAP_HOST = os.getenv("EMAIL_IMAP_HOST", "imap.gmail.com").strip()
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "helios.cvtechlabs@gmail.com").strip()
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+EMAIL_APP_PASSWORD = _secret("EMAIL_APP_PASSWORD").replace(" ", "")
 # Only application emails whose subject contains this are processed.
 EMAIL_SUBJECT_FILTER = os.getenv("EMAIL_SUBJECT_FILTER", "New application for").strip()
 # How many days back each fetch looks (already-fetched emails are skipped).

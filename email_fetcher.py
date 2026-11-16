@@ -41,6 +41,7 @@ except ImportError:  # only needed for Indeed links
     PWError, async_playwright = Exception, None
 
 import config
+import forksafe
 import resume_parser
 import storage
 import zoho_workdrive as wd
@@ -370,6 +371,15 @@ def _reset_state() -> None:
 
 
 _reset_state()
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _folder_lock, _state_lock
+    _folder_lock = Lock()
+    _state_lock = Lock()
+    if _state.get("running"):        # the fetch thread didn't survive the fork
+        _reset_state()
 
 
 def status() -> dict:

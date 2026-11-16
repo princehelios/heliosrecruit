@@ -19,6 +19,7 @@ import time
 
 import requests
 
+import forksafe
 from http_client import SESSION
 
 import config
@@ -37,6 +38,12 @@ _TIMESTAMP_HEADER = re.compile(r"^time ?stamp$", re.I)
 
 _cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _cache_lock
+    _cache_lock = threading.Lock()
 
 
 def parse_url(url: str) -> tuple[str, str]:

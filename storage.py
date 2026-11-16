@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import config
+import forksafe
 
 _lock = threading.RLock()
 
@@ -152,6 +153,15 @@ def now() -> str:
 
 
 _db: sqlite3.Connection | None = None
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    # A SQLite connection must never be shared across a fork: drop the
+    # parent's (without closing it) and open a fresh one on next use.
+    global _lock, _db
+    _lock = threading.RLock()
+    _db = None
 
 
 def _open() -> sqlite3.Connection:

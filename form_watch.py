@@ -15,6 +15,7 @@ import time
 import traceback
 
 import config
+import forksafe
 import google_sheets
 import resume_parser
 import storage
@@ -25,6 +26,14 @@ from zoho_workdrive import WorkDriveError
 _lock = threading.Lock()          # one check at a time
 _started = False
 _state = {"last_check": None, "running": False, "errors": {}, "newly_filled": 0}
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _lock, _started
+    _lock = threading.Lock()
+    _started = False                 # the watcher thread did not survive the fork; app.py restarts it
+    _state["running"] = False
 
 
 def status() -> dict:

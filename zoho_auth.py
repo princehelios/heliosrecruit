@@ -9,6 +9,7 @@ import threading
 import time
 import requests
 
+import forksafe
 from http_client import SESSION
 import config
 
@@ -25,6 +26,15 @@ _refresh_lock = threading.Lock()
 # refresh-token rate limit, which kept the failure going indefinitely.
 _FAILURE_COOLDOWN = 60
 _last_failure = {"error": None, "at": 0.0}
+# Longest a caller waits for another thread's refresh. A refresh is bounded
+# (~35 s worst case), so hitting this means the lock is stuck, not busy.
+_LOCK_WAIT = 45
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _refresh_lock
+    _refresh_lock = threading.Lock()
 
 
 class ZohoAuthError(Exception):
@@ -49,7 +59,11 @@ def get_access_token() -> str:
     if (err := _recent_failure(now)):
         raise ZohoAuthError(err)
 
-    with _refresh_lock:
+    lock = _refresh_lock
+    if not lock.acquire(timeout=_LOCK_WAIT):
+        raise ZohoAuthError(f"Timed out after {_LOCK_WAIT}s waiting for the Zoho token refresh. "
+                            "Try again; if it keeps happening, restart the service.")
+    try:
         # Another thread may have refreshed (or failed) while we waited for the lock.
         now = time.time()
         if _fresh(now):
@@ -63,6 +77,8 @@ def get_access_token() -> str:
             raise
         _last_failure.update(error=None, at=0.0)
         return token
+    finally:
+        lock.release()
 
 
 def _refresh(now: float) -> str:

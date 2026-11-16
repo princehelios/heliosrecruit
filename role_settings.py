@@ -16,6 +16,7 @@ import time
 import traceback
 
 import config
+import forksafe
 import storage
 import zoho_workdrive
 from zoho_auth import ZohoAuthError
@@ -24,6 +25,12 @@ from zoho_workdrive import WorkDriveError
 _FIELDS = ("jd_text", "form_sheet_url", "form_url", "invite_subject", "invite_body")
 _state = {"restored": 0, "last_restore": None, "error": None, "done": False}
 _started = False
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _started
+    _started = _state["done"]        # restart the restore only if it hadn't finished
 
 
 def status() -> dict:

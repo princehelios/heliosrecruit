@@ -28,6 +28,7 @@ import requests
 from http_client import SESSION
 
 import config
+import forksafe
 from zoho_auth import auth_header
 
 
@@ -616,6 +617,16 @@ def trash_item(item_id: str) -> dict:
 
 
 _pending_lock = threading.Lock()
+
+
+@forksafe.after_fork
+def _reset_after_fork() -> None:
+    global _list_lock, _folder_cache_lock, _pending_lock, _refresher
+    _list_lock = threading.Lock()
+    _folder_cache_lock = threading.Lock()
+    _pending_lock = threading.Lock()
+    _list_inflight.clear()          # those futures belonged to threads that no longer exist
+    _refresher = ThreadPoolExecutor(max_workers=16, thread_name_prefix="wd-list")
 
 
 def special_folder(role_folder_id: str, name: str) -> str:
