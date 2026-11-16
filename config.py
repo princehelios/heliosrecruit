@@ -141,3 +141,31 @@ EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "").replace(" ", "").strip(
 EMAIL_SUBJECT_FILTER = os.getenv("EMAIL_SUBJECT_FILTER", "New application for").strip()
 # How many days back each fetch looks (already-fetched emails are skipped).
 EMAIL_LOOKBACK_DAYS = int(os.getenv("EMAIL_LOOKBACK_DAYS", "7"))
+
+# ---- Google Form invites (sent to applicants after an email fetch) ----
+# Sent from EMAIL_ADDRESS through Gmail SMTP with the same App Password.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Hiring Team").strip()
+# Before sending, Gmail's Sent folder is searched this far back for an earlier
+# invite to the same address for the same position, so nobody gets it twice -
+# even after a redeploy wipes the database.
+INVITE_DEDUPE_DAYS = int(os.getenv("INVITE_DEDUPE_DAYS", "120"))
+# Placeholders: {name} {first_name} {position} {form_link}
+DEFAULT_INVITE_SUBJECT = "Next step for your {position} application"
+DEFAULT_INVITE_BODY = """Hi {first_name},
+
+Thank you for applying for the {position} role. We have received your resume.
+
+As the next step, please fill in this short form:
+{form_link}
+
+Please use the same email address and phone number as on your resume, so we can match your answers to your application.
+
+Best regards,
+Hiring Team"""
+
+# Each position's settings (JD, sheet link, form link, invite template) are also
+# saved as this file inside the position's WorkDrive folder. Render's free plan
+# wipes the database on every deploy; on start-up they are restored from here.
+ROLE_SETTINGS_FILE = "_screener-settings.json"

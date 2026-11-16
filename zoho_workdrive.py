@@ -97,7 +97,7 @@ def list_children(folder_id: str, *, cached: bool = False) -> dict:
 
 def _list_children_live(folder_id: str) -> dict:
     url = f"{config.WORKDRIVE_API_BASE}/files/{folder_id}/files"
-    folders, files = [], []
+    folders, files, others = [], [], []
     # page[offset] is a 0-indexed RECORD offset, not a page number.
     offset = 0
     while True:
@@ -127,13 +127,16 @@ def _list_children_live(folder_id: str) -> dict:
                     "added": a.get("uploaded_time_in_millisecond") or a.get("created_time_in_millisecond"),
                     "uploaded_by": (a.get("created_by") or ""),
                 })
+            else:
+                # Not shown in the app; lets the position settings file be found.
+                others.append({"id": item["id"], "name": name})
         if len(items) < PAGE_LIMIT:
             break
         offset += PAGE_LIMIT
 
     folders.sort(key=lambda f: f.get("modified") or 0, reverse=True)
     files.sort(key=lambda f: f["name"].lower())
-    return {"folders": folders, "files": files}
+    return {"folders": folders, "files": files, "others": others}
 
 
 # ---------------------------------------------------------------- listing cache
@@ -469,6 +472,33 @@ def upload_resume(folder_id: str, filename: str, content: bytes) -> dict:
     except (ValueError, KeyError, IndexError, TypeError):
         file_id, attrs = None, {}
     return {"id": file_id, "name": attrs.get("FileName") or attrs.get("name") or filename}
+
+
+def save_settings_file(folder_id: str, filename: str, content: bytes) -> str:
+    """Writes a small app file (the position settings JSON) into a position
+    folder, replacing the previous copy. Returns the file id."""
+    path = resolve_path(folder_id)
+    if len(path) != 2:
+        raise WorkDriveError("Settings files belong in position folders.")
+    url = f"{config.WORKDRIVE_API_BASE}/upload"
+    try:
+        resp = SESSION.post(
+            url, headers=auth_header(),
+            # true = replace the existing file of that name (a new version of it)
+            data={"parent_id": folder_id, "filename": filename, "override-name-exist": "true"},
+            files={"content": (filename, content, "application/json")},
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as e:
+        raise WorkDriveError(f"Could not reach WorkDrive upload API: {e}")
+    invalidate_listings()
+    if resp.status_code not in (200, 201):
+        raise WorkDriveError(_create_error(f"Could not save '{filename}'", resp))
+    try:
+        item = resp.json()["data"][0]
+        return (item.get("attributes") or {}).get("resource_id") or item.get("id")
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ""
 
 
 def _create_error(prefix: str, resp) -> str:

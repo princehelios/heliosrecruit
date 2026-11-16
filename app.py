@@ -27,7 +27,9 @@ import email_fetcher
 import form_watch
 import google_sheets
 import keepalive
+import mailer
 import pipeline
+import role_settings
 import storage
 import zoho_auth
 import zoho_recruit
@@ -50,8 +52,12 @@ storage.init_db()
 _interrupted = storage.mark_interrupted_runs()
 if _interrupted:
     print(f"Marked {_interrupted} interrupted run(s) from a previous server session as failed.")
+_stuck = storage.reset_stuck_invites()
+if _stuck:
+    print(f"Put {_stuck} form invite(s) interrupted mid-send back to 'ready'.")
 form_watch.start()
 keepalive.start()
+role_settings.start()   # refills position settings from WorkDrive after a redeploy
 
 
 # ------------------------------------------------- static assets & transfer
@@ -175,6 +181,8 @@ def handle_uncaught(e):
             return _error(str(e), 400)
         if isinstance(e, SheetError):
             return _error(str(e), 400)
+        if isinstance(e, mailer.MailError):
+            return _error(str(e), 400)
         return _error(f"Unexpected server error: {e}", 500)
     raise e
 
@@ -205,6 +213,7 @@ def api_status():
         "openai_configured": bool(config.OPENAI_API_KEY),
         "model": config.OPENAI_MODEL,
         "keepalive": keepalive.status(),
+        "settings_restore": role_settings.status(),
         "zoho_connected": False,
         "scopes": [],
         "recruit_schema": None,
@@ -344,6 +353,7 @@ def api_save_jd(role_folder_id):
     change = "created" if not (previous and previous["jd_text"].strip()) else (
         "updated" if previous["jd_text"] != jd_text else "saved (no change)")
     storage.log("info", f"Job description for '{path[1]['name']}' {change}.")
+    role_settings.backup(role_folder_id)
     return jsonify(saved)
 
 
@@ -372,7 +382,8 @@ def api_roles():
     for f in zoho_workdrive.list_children(config.WORKDRIVE_ROOT_FOLDER_ID, cached=True)["folders"]:
         jd = jds.get(f["id"]) or {}
         roles.append({"id": f["id"], "name": f["name"], "has_jd": bool((jd.get("jd_text") or "").strip()),
-                      "form_sheet_url": jd.get("form_sheet_url") or ""})
+                      "form_sheet_url": jd.get("form_sheet_url") or "", "form_url": jd.get("form_url") or "",
+                      "custom_template": bool(jd.get("invite_subject") or jd.get("invite_body"))})
     roles.sort(key=lambda r: r["name"].lower())
     return jsonify({"roles": roles})
 
@@ -384,6 +395,7 @@ def api_save_sheet(role_folder_id):
     url, info = _checked_sheet_url(body.get("form_sheet_url"))
     previous = (storage.get_jd(role_folder_id) or {}).get("form_sheet_url") or ""
     storage.set_form_sheet(role_folder_id, role["name"], url)
+    role_settings.backup(role_folder_id)
     if url != previous:
         storage.log("info", f"Google Form sheet for '{role['name']}' "
                             + (f"set ({info['responses']} responses)." if url else "removed - resumes are scored alone."))
@@ -659,6 +671,105 @@ def api_add_walkin():
         warning = f"Saved, but not scored yet: {e}"
     return jsonify({"file_id": up["id"], "name": up["name"], "folder_id": folder_id,
                     "run_id": run_id, "warning": warning}), 201
+
+
+# ---------------------------------------------------------------- Google Form invites
+
+_FORM_URL_RE = re.compile(r"^https://(docs\.google\.com/forms/|forms\.gle/)\S+$")
+
+
+@app.get("/api/roles/<role_folder_id>/invite")
+def api_get_invite_settings(role_folder_id):
+    jd = storage.get_jd(role_folder_id) or {}
+    return jsonify({"form_url": jd.get("form_url") or "",
+                    "invite_subject": jd.get("invite_subject") or "", "invite_body": jd.get("invite_body") or "",
+                    "default_subject": config.DEFAULT_INVITE_SUBJECT, "default_body": config.DEFAULT_INVITE_BODY,
+                    "from": f"{config.EMAIL_FROM_NAME} <{config.EMAIL_ADDRESS}>"})
+
+
+@app.put("/api/roles/<role_folder_id>/invite")
+def api_save_invite_settings(role_folder_id):
+    body = request.get_json(force=True, silent=True) or {}
+    role = _role_folder(role_folder_id)
+    jd = storage.get_jd(role_folder_id) or {}
+    form_url = (body.get("form_url", jd.get("form_url")) or "").strip()
+    if form_url and not _FORM_URL_RE.match(form_url):
+        return _error("That doesn't look like a Google Form link. Open the form, click Send → the link icon, "
+                      "and copy the link (it starts with https://docs.google.com/forms/ or https://forms.gle/).", 400)
+    subject = (body.get("invite_subject", jd.get("invite_subject")) or "").strip()
+    text = (body.get("invite_body", jd.get("invite_body")) or "").strip()
+    # Saving the default text unchanged keeps the row on the default, so a later
+    # improvement to the default reaches every position that never customised it.
+    if subject == config.DEFAULT_INVITE_SUBJECT:
+        subject = ""
+    if text == config.DEFAULT_INVITE_BODY.strip():
+        text = ""
+    if text and "{form_link}" not in text:
+        return _error("The email text must contain {form_link} - that's where the form link goes.", 400)
+    storage.set_invite_settings(role_folder_id, role["name"], form_url, subject, text)
+    role_settings.backup(role_folder_id)
+    storage.log("info", f"Google Form invite settings for '{role['name']}' saved"
+                        + ("" if form_url else " (no form link - invites can't be sent)") + ".")
+    return api_get_invite_settings(role_folder_id)
+
+
+@app.post("/api/roles/<role_folder_id>/invite/test")
+def api_test_invite(role_folder_id):
+    role = _role_folder(role_folder_id)
+    to = mailer.send_test(role_folder_id, role["name"], storage.get_jd(role_folder_id))
+    return jsonify({"sent_to": to})
+
+
+@app.get("/api/invites")
+def api_invites():
+    jds = storage.list_jds()
+    rows = storage.list_invites()
+    roles: dict = {}
+    for r in rows:
+        role = roles.setdefault(r["role_folder_id"], {
+            "id": r["role_folder_id"], "name": r["role_name"],
+            "form_url": (jds.get(r["role_folder_id"]) or {}).get("form_url") or "", "items": []})
+        role["items"].append(r)
+    return jsonify({"roles": sorted(roles.values(), key=lambda x: x["name"].lower()),
+                    "sender": mailer.status(), "from": f"{config.EMAIL_FROM_NAME} <{config.EMAIL_ADDRESS}>"})
+
+
+@app.post("/api/invites/send")
+def api_send_invites():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        ids = [int(i) for i in body.get("ids") or []]
+    except (TypeError, ValueError):
+        return _error("ids must be a list of invite ids.", 400)
+    if not ids:
+        return _error("Select at least one applicant.", 400)
+    return jsonify(mailer.send_invites(ids))
+
+
+@app.get("/api/invites/status")
+def api_invites_status():
+    return jsonify({**mailer.status(), "ready": storage.invites_ready_count()})
+
+
+@app.patch("/api/invites/<int:invite_id>")
+def api_update_invite(invite_id):
+    inv = storage.get_invite(invite_id)
+    if not inv:
+        return _error("Invite not found.", 404)
+    if inv["status"] in ("sending", "sent"):
+        return _error("This invite has already gone out.", 400)
+    body = request.get_json(force=True, silent=True) or {}
+    if "email" in body:
+        email = (body.get("email") or "").strip().lower()
+        if email and not mailer.valid_email(email):
+            return _error(f"'{email}' is not a valid email address.", 400)
+        storage.update_invite(invite_id, email=email or None, email_source="manual" if email else None,
+                              status="ready" if email else "no_email", error=None)
+    if body.get("dismiss") is True:
+        storage.update_invite(invite_id, status="dismissed")
+    if body.get("restore") is True and inv["status"] == "dismissed":
+        storage.update_invite(invite_id, status="ready" if inv["email"] else "no_email")
+    return jsonify(storage.get_invite(invite_id))
 
 
 # ---------------------------------------------------------------- Google Form pending & notifications

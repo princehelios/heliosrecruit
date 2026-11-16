@@ -41,6 +41,7 @@ except ImportError:  # only needed for Indeed links
     PWError, async_playwright = Exception, None
 
 import config
+import resume_parser
 import storage
 import zoho_workdrive as wd
 
@@ -112,6 +113,40 @@ def parse_position(subject: str) -> str:
     if not m:
         raise EmailFetchError(f"Can't read the position from subject: {subject!r}")
     return wd.clean_folder_name(m.group(1).split(",")[0])
+
+
+_NOT_APPLICANT = re.compile(r"no-?reply|do-?not-?reply|notifications?@|alert", re.I)
+
+
+def _reply_to(msg) -> str:
+    """The applicant's address as the job board gives it (Indeed puts a relay
+    address that forwards to the applicant in Reply-To). '' if there isn't one."""
+    addr = email.utils.parseaddr(_decode(msg.get("Reply-To")))[1].strip().lower()
+    if not addr or "@" not in addr or addr == config.EMAIL_ADDRESS.lower() or _NOT_APPLICANT.search(addr):
+        return ""
+    return addr
+
+
+def _queue_invite(job: dict, filed: dict, content: bytes, ext: str) -> str:
+    """Adds the applicant to the Form invites review list (nothing is sent
+    here). Email comes from the resume first, then the mail's Reply-To."""
+    emails: list[str] = []
+    try:
+        emails = resume_parser.find_contacts(resume_parser.extract(content, f"x{ext}"))["emails"]
+    except Exception as e:  # noqa: BLE001 - an unreadable resume still gets a row, without email
+        storage.log("warn", f"Could not read an email address from {job['name']}'s resume: {e}")
+    if emails:
+        chosen, source = emails[0], "resume"
+    elif job.get("reply_to"):
+        chosen, source = job["reply_to"], "indeed"
+    else:
+        chosen, source = "", ""
+    others = [e for e in emails + ([job["reply_to"]] if job.get("reply_to") else []) if e != chosen]
+    storage.add_invite(file_id=filed["file_id"], file_name=filed["file_name"],
+                       role_folder_id=filed["role_folder_id"], role_name=job["position"],
+                       candidate=job["name"], email=chosen, email_source=source,
+                       other_emails=list(dict.fromkeys(others)), applied_at=job["when"].isoformat())
+    return chosen
 
 
 def _candidate_name(msg, html: str, text: str) -> str:
@@ -319,7 +354,7 @@ def file_resume(position: str, when: datetime, filename: str, content: bytes, ca
                 raise
             time.sleep(2 * (attempt + 1))
     return {"file_id": up["id"], "file_name": up["name"], "folder": f"{position} / {date_label(when)}",
-            "new_position_folder": role_new, "new_date_folder": date_new}
+            "role_folder_id": role_id, "new_position_folder": role_new, "new_date_folder": date_new}
 
 
 # ---------------------------------------------------------------- progress state
@@ -417,7 +452,8 @@ def _scan() -> list[dict]:
                     except (TypeError, ValueError):
                         when = datetime.now()
                     jobs.append({"mid": mid, "subject": subject, "position": parse_position(subject),
-                                 "link": link, "name": _candidate_name(msg, html, text), "when": when})
+                                 "link": link, "name": _candidate_name(msg, html, text), "when": when,
+                                 "reply_to": _reply_to(msg)})
                 except EmailFetchError as e:
                     storage.log("warn", f"Email fetch failed for '{subject}': {e}")
                     _record({"subject": subject, "ok": False, "error": str(e)})
@@ -495,6 +531,10 @@ def _run() -> None:
                 storage.mark_email_fetched(job["mid"], job["position"], job["name"], filed["file_name"], filed["file_id"])
                 storage.log("info", f"Email fetch: {job['name']} -> {filed['folder']}")
                 item.update(ok=True, **filed)
+                try:
+                    item["invite_email"] = _queue_invite(job, filed, content, ext)
+                except Exception as e:  # noqa: BLE001 - the resume is saved; the invite row is extra
+                    storage.log("warn", f"Could not add {job['name']} to Form invites: {e}")
             except (EmailFetchError, wd.WorkDriveError) as e:
                 storage.log("warn", f"Email fetch failed for {job['name']} ('{job['subject']}'): {e}")
                 item.update(ok=False, error=str(e))

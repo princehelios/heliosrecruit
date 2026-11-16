@@ -139,6 +139,28 @@ ek PDF/DOCX, ya printed resume ki photos (har page ki ek photo; phone pe camera 
 - Scanned / photo resumes (walk-in ya normal) ka text AI OCR se padha jaata hai (max 3 page,
   `OCR_MAX_PAGES`): ~₹0.3-0.5 per page, aur 1-2 minute lag sakte hain.
 
+### Google Form invites (email se aaye applicants ko form bhejo)
+
+1. **Form sheets** page → har position pe **Add form link** → Google Form ka link
+   (form me *Send → link icon → Copy*, `https://forms.gle/...`) aur email ka subject/text.
+   Text me `{first_name}` `{name}` `{position}` `{form_link}` placeholders chalte hain.
+   **Save & send test to me** se pehle khud ko test mail bhejo.
+2. **Fetch from email** ke baad har applicant **Form invites** page pe aa jata hai. Email unke
+   resume se padha jata hai; resume me na ho to Indeed mail ka Reply-To (relay address) use hota hai.
+   Na mile to wahin type kar do.
+3. Check karo, phir **Send** / **Send to all ready** / **Send selected**. **Apne aap kuch nahi jaata.**
+
+- Mail `EMAIL_ADDRESS` se jaati hai (wahi Gmail App Password, SMTP). Sender ka naam `EMAIL_FROM_NAME`.
+- **Kisi ko do baar nahi jaata:** bhejne se pehle Gmail ke **Sent** folder me us address ko us
+  position ka invite dhoondha jata hai (`X-Screener-Invite` header). Sent folder redeploy pe nahi
+  udta, isliye database wipe hone ke baad bhi duplicate nahi jaata.
+- Gmail limit: ~500 mails/din (normal account). Har mail ke beech 1 second ka gap hai.
+
+**Settings ab WorkDrive me bhi save hoti hain.** JD, response sheet link, form link aur email
+template har save pe `ROOT / <position> / _screener-settings.json` me bhi likhe jaate hain. Free
+plan pe redeploy ke baad app start hote hi wahan se wapas aa jaate hain. (Run history, Candidates
+list aur Form invites ki list abhi bhi database me hi hai - wo redeploy pe jaati hai.)
+
 ### Render pe deploy (free plan)
 
 **1. Code push karo**
@@ -179,9 +201,10 @@ Band karna ho to `KEEPALIVE_ENABLED=false`, ya interval badalna ho to `KEEPALIVE
 - **750 instance-hours/month** saari free web services milake. Ise 24/7 jagaye rakhne me
   ~730 hours lagte hain, to ye tumhari **ekloti** free service honi chahiye - warna mahine
   ke end me Render suspend kar dega. (Starter $7 pe ye limit hai hi nahi.)
-- **Persistent disk nahi milta.** Har deploy/restart pe `screener.db` ud jata hai - JDs,
-  sheet links, history sab. Form Pending list WorkDrive se khud rebuild ho jati hai,
-  JDs/sheet links **nahi**. Bachane ka ek hi tareeka: Starter plan + disk (`/var/data`) aur
+- **Persistent disk nahi milta.** Har deploy/restart pe `screener.db` ud jata hai. JDs, sheet
+  links, form links aur email templates WorkDrive ki settings file se khud wapas aa jaate hain, aur
+  Form Pending list bhi WorkDrive se rebuild hoti hai. Run history, Candidates aur Form invites
+  list **nahi** bachti. Wo bhi chahiye to: Starter plan + disk (`/var/data`) aur
   `DATABASE_PATH=/var/data/screener.db` (render.yaml me comment kiya hua hai).
 - **512 MB RAM.** Isliye `FETCH_TABS=1` hai. Run OOM ho to `MAX_PARALLEL_RESUMES=2` kar do.
 

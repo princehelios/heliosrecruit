@@ -12,10 +12,11 @@ services:
     #   * 750 instance-hours/month across ALL your free web services. Keeping
     #     this one awake 24/7 uses ~730, so it must be your only free service
     #     or Render will suspend it near month end.
-    #   * NO persistent disk. screener.db is wiped on every deploy and restart,
-    #     taking job descriptions, sheet links and history with it. The Form
-    #     Pending list rebuilds itself from WorkDrive; JDs and sheet links do
-    #     not. Upgrade to Starter + a disk at /var/data to keep them.
+    #   * NO persistent disk. screener.db is wiped on every deploy and restart.
+    #     JDs, sheet/form links and invite templates come back from each
+    #     position's _screener-settings.json in WorkDrive, and the Form Pending
+    #     list rebuilds itself; run history, Candidates and the Form invites list
+    #     do not. Upgrade to Starter + a disk at /var/data to keep those too.
     plan: free
     # Chromium is downloaded INTO the project folder (PLAYWRIGHT_BROWSERS_PATH=0) so it
     # is still there at runtime; the Indeed resume download runs in it, headless.
@@ -62,6 +63,8 @@ services:
         value: helios.cvtechlabs@gmail.com
       - key: EMAIL_APP_PASSWORD
         sync: false
+      - key: EMAIL_FROM_NAME
+        value: Hiring Team   # sender name on the Google Form invites
       - key: FORM_CHECK_MINUTES
         value: "10"  # how often Google Form response sheets are re-checked
       # On Starter + a persistent disk mounted at /var/data, uncomment so the

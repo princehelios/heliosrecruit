@@ -7,6 +7,7 @@
             #/folder/<id>      position or date folder: JD, resumes, screen
             #/candidates       screened candidates
             #/pending          resumes waiting for the Google Form
+            #/invites          fetched applicants to send the Google Form to (review, then send)
             #/sheets           Google Form response sheet link per position
             #/log              activity log
             #/run/<id>         one run
@@ -196,6 +197,7 @@ async function route() {
   let m;
   const nav = hash.startsWith("#/dashboard") ? "dashboard" : hash.startsWith("#/candidates") ? "candidates"
     : hash.startsWith("#/pending") ? "pending" : hash.startsWith("#/sheets") ? "sheets"
+    : hash.startsWith("#/invites") ? "invites"
     : (hash.startsWith("#/log") || hash.startsWith("#/run/")) ? "log" : "screen";
   $$(".nav a").forEach(a => a.classList.toggle("active", a.dataset.nav === nav));
   window.scrollTo(0, 0);
@@ -204,6 +206,7 @@ async function route() {
   if (nav === "candidates") return renderCandidates(view);
   if (nav === "pending") return renderPending(view);
   if (nav === "sheets") return renderSheets(view);
+  if (nav === "invites") return renderInvites(view);
   if ((m = hash.match(/^#\/run\/(\d+)/))) return renderRun(view, Number(m[1]));
   if (nav === "log") return renderLog(view);
   m = hash.match(/^#\/folder\/([A-Za-z0-9]+)/);
@@ -931,6 +934,12 @@ async function fetchEmails(data, { attach = false } = {}) {
     else if (!st.total) toast("No new application emails.");
     else toast(`Fetched ${st.saved} of ${st.total} resumes${st.failed ? ` · ${st.failed} failed` : ""}`, st.failed ? "error" : "info");
     results.filter(r => !r.ok).slice(0, 5).forEach(r => toast(`${r.candidate || r.subject}: ${r.error}`, "error"));
+    const queued = results.filter(r => r.ok).length;
+    if (queued) {
+      const noEmail = results.filter(r => r.ok && !r.invite_email).length;
+      toast(`${plural(queued, "applicant")} added to Form invites${noEmail ? ` (${noEmail} without an email - add it there)` : ""}. Review and send the Google Form from the Form invites page.`, "success");
+      loadInviteBadge();
+    }
     reset();
     if (location.hash === "#/" || location.hash === "") route();
   };
@@ -1066,13 +1075,17 @@ async function renderSheets(view) {
   try { data = await api("/api/roles"); } catch (e) { return errorView(view, e.message); }
   view.innerHTML = `
     <div class="page-head"><div><h1>Form sheets</h1>
-      <div class="sub">One Google Form response sheet per position. Resumes are matched to responses by email or phone before scoring.</div></div></div>
+      <div class="sub">Per position: the Google Form applicants are invited to fill, and its response sheet. Resumes are matched to responses by email or phone before scoring.</div></div></div>
     <div class="stack">
       <div class="callout info">${I.warn}<div>${SHEET_HELP}</div></div>
       <section class="card">${data.roles.length ? `<div class="table-wrap"><table class="sheets-table">
-        <thead><tr><th>Position</th><th>Response sheet link</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Position</th><th>Google Form link (sent to applicants)</th><th>Response sheet link</th><th>Status</th><th></th></tr></thead>
         <tbody>${data.roles.map(r => `<tr data-role="${esc(r.id)}">
           <td><a href="#/folder/${esc(r.id)}"><b>${esc(r.name)}</b></a>${r.has_jd ? "" : `<div class="secondary-text">no job description yet</div>`}</td>
+          <td><div class="form-link-cell">${r.form_url
+              ? `<a href="${esc(safeUrl(r.form_url) || "#")}" target="_blank" rel="noopener noreferrer" class="small" title="${esc(r.form_url)}">${esc(r.form_url.replace(/^https:\/\//, "").slice(0, 38))}…</a>`
+              : `<span class="tag warn">Not set</span>`}
+            <button class="btn sm invite-edit">${r.form_url ? "Edit link & email" : "Add form link"}</button></div></td>
           <td><input type="text" class="sheet-input" placeholder="https://docs.google.com/spreadsheets/d/…" value="${esc(r.form_sheet_url)}"></td>
           <td class="sheet-status nowrap">${r.form_sheet_url ? sheetStatusHtml(null) : sheetStatusHtml({ linked: false })}</td>
           <td class="nowrap"><button class="btn sm primary sheet-save">Save</button>
@@ -1100,6 +1113,7 @@ async function renderSheets(view) {
     };
     btn.addEventListener("click", save);
     input.addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+    $(".invite-edit", row).addEventListener("click", () => inviteDialog(role, () => renderSheets(view)));
     if (role.form_sheet_url) {
       api(`/api/roles/${encodeURIComponent(id)}/sheet`)
         .then(sh => { status.innerHTML = sheetStatusHtml(sh); status.title = sh.ok ? "" : sh.error || ""; })
@@ -2183,5 +2197,208 @@ document.addEventListener("pointerover", e => {
 loadStatus().then(() => { if (state.folder && $("#resume-rows")) renderResumeRows(); });
 route();
 loadNotifications();
+loadInviteBadge();
 setInterval(loadStatus, 60000);
 setInterval(loadNotifications, 60000);
+setInterval(loadInviteBadge, 60000);
+
+
+/* ---------------------------------------------------------------- Google Form invites
+   Applicants fetched from email land here with the email read from their resume.
+   Nothing is sent automatically: the team reviews, fixes emails, then clicks Send.
+   Each position's form link + email template is set in inviteDialog (Form sheets page). */
+
+const INVITE_STATUS = {
+  ready: ["blue", "Ready"], no_email: ["warn", "No email"], sending: ["", "Sending…"], sent: ["good", "✓ Sent"],
+  already_sent: ["good", "Sent earlier"], failed: ["bad", "Failed"], dismissed: ["", "Dismissed"],
+};
+const SOURCE_LABEL = { resume: "from resume", indeed: "from Indeed reply-to", manual: "typed in" };
+const invState = { show: "open", selected: new Set(), poll: null };
+
+async function loadInviteBadge() {
+  let n;
+  try { n = await api("/api/invites/status"); } catch { return; }
+  const badge = $("#invites-badge");
+  if (!badge) return;
+  badge.textContent = n.ready > 99 ? "99+" : String(n.ready);
+  badge.hidden = !n.ready;
+  badge.title = `${plural(n.ready, "applicant")} ready for the Google Form`;
+}
+
+function inviteDialog(role, onSaved) {
+  openModal(`<h2>Google Form invite · ${esc(role.name)}</h2><div class="loading-block" style="padding:30px 0"><span class="spinner"></span> Loading…</div>`, { wide: true });
+  api(`/api/roles/${encodeURIComponent(role.id)}/invite`).then(cfg => {
+    openModal(`
+      <h2>Google Form invite · ${esc(role.name)}</h2>
+      <p class="muted small">Sent from <b>${esc(cfg.from)}</b> to applicants you select on the Form invites page.
+        Placeholders: <code>{first_name}</code> <code>{name}</code> <code>{position}</code> <code>{form_link}</code></p>
+      <div class="field"><label for="inv-url">Google Form link</label>
+        <input type="text" id="inv-url" placeholder="https://forms.gle/…  or  https://docs.google.com/forms/…" value="${esc(cfg.form_url)}">
+        <div class="muted small">In the form click <b>Send</b> → the link icon → Copy. Use the form link, not the response sheet.</div></div>
+      <div class="field"><label for="inv-subject">Email subject</label>
+        <input type="text" id="inv-subject" value="${esc(cfg.invite_subject || cfg.default_subject)}"></div>
+      <div class="field"><label for="inv-body">Email text</label>
+        <textarea id="inv-body" rows="12">${esc(cfg.invite_body || cfg.default_body)}</textarea></div>
+      <div class="modal-actions">
+        <button class="btn" id="inv-reset" title="Put the standard subject and text back">Use default text</button>
+        <button class="btn" id="inv-test">Save & send test to me</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-close>Cancel</button>
+        <button class="btn primary" id="inv-save">Save</button>
+      </div>`, { wide: true });
+    $("#inv-reset").addEventListener("click", () => { $("#inv-subject").value = cfg.default_subject; $("#inv-body").value = cfg.default_body; });
+    const save = async () => api(`/api/roles/${encodeURIComponent(role.id)}/invite`, { method: "PUT", body: {
+      form_url: $("#inv-url").value.trim(), invite_subject: $("#inv-subject").value, invite_body: $("#inv-body").value } });
+    const busy = (b, on, label) => { b.disabled = on; b.innerHTML = on ? `<span class="spinner"></span>` : label; };
+    $("#inv-save").addEventListener("click", async () => {
+      const b = $("#inv-save"); busy(b, true);
+      try { await save(); closeModal(); toast("Google Form invite saved", "success"); onSaved && onSaved(); }
+      catch (e) { toast(e.message, "error"); busy(b, false, "Save"); }
+    });
+    $("#inv-test").addEventListener("click", async () => {
+      const b = $("#inv-test"); busy(b, true);
+      try {
+        await save();
+        const r = await api(`/api/roles/${encodeURIComponent(role.id)}/invite/test`, { method: "POST" });
+        toast(`Test email sent to ${r.sent_to} - check that inbox`, "success");
+      } catch (e) { toast(e.message, "error"); }
+      busy(b, false, "Save & send test to me");
+    });
+  }).catch(e => { closeModal(); toast(e.message, "error"); });
+}
+
+async function renderInvites(view, { quiet = false } = {}) {
+  if (!quiet) loading(view);
+  let data;
+  try { data = await api("/api/invites"); } catch (e) { return errorView(view, e.message); }
+  const all = data.roles.flatMap(r => r.items);
+  const count = st => all.filter(i => i.status === st).length;
+  const open = i => !["sent", "already_sent", "dismissed"].includes(i.status);
+  const sending = data.sender?.running;
+  invState.selected = new Set([...invState.selected].filter(id => all.some(i => i.id === id && i.status === "ready")));
+
+  const rowHtml = (i, role) => {
+    const [cls, label] = INVITE_STATUS[i.status] || ["", i.status];
+    const editable = ["ready", "no_email", "failed"].includes(i.status);
+    const sendable = (i.status === "ready" || i.status === "failed") && i.email && role.form_url;
+    return `<tr data-inv="${i.id}">
+      <td class="check">${i.status === "ready" && role.form_url ? `<input type="checkbox" data-pick="${i.id}" ${invState.selected.has(i.id) ? "checked" : ""} aria-label="Select ${esc(i.candidate)}">` : ""}</td>
+      <td><div class="primary-text">${esc(i.candidate)}</div><div class="secondary-text" title="${esc(i.file_name || "")}">${esc(i.file_name || "")}</div></td>
+      <td>${editable
+        ? `<input type="email" class="inv-email" value="${esc(i.email || "")}" placeholder="add email…" aria-label="Email for ${esc(i.candidate)}">`
+        : esc(i.email || "")}
+        <div class="secondary-text">${esc(SOURCE_LABEL[i.email_source] || "")}${i.other_emails?.length ? ` · also: ${esc(i.other_emails.join(", "))}` : ""}</div></td>
+      <td class="muted small nowrap">${i.applied_at ? esc(when(i.applied_at)) : ""}</td>
+      <td class="nowrap"><span class="tag ${cls}" ${i.error ? `title="${esc(i.error)}"` : ""}>${label}</span>
+        ${i.sent_at ? `<div class="secondary-text">${esc(when(i.sent_at))}</div>` : ""}
+        ${i.error ? `<div class="secondary-text" style="color:var(--bad);max-width:260px;white-space:normal">${esc(i.error)}</div>` : ""}</td>
+      <td class="nowrap">${sendable ? `<button class="btn sm primary" data-send-one="${i.id}">Send</button>` : ""}
+        ${editable ? `<button class="btn sm" data-dismiss="${i.id}" title="Don't send to this applicant">Dismiss</button>` : ""}
+        ${i.status === "dismissed" ? `<button class="btn sm" data-restore="${i.id}">Undo</button>` : ""}</td>
+    </tr>`;
+  };
+
+  const roles = data.roles.map(r => ({ ...r, shown: r.items.filter(i => invState.show === "all" || open(i)) })).filter(r => r.shown.length);
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Form invites</h1>
+      <div class="sub">Applicants fetched from email. Check the address, then send them the position's Google Form from
+        <b>${esc(data.from)}</b>. Nobody is emailed until you click Send, and nobody gets the same form twice.</div></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="inv-show" aria-label="Show"><option value="open" ${invState.show === "open" ? "selected" : ""}>To do</option>
+          <option value="all" ${invState.show === "all" ? "selected" : ""}>Everything (incl. sent)</option></select>
+        <button class="btn primary" id="inv-send-sel" disabled>Send selected</button></div></div>
+    <div class="stack">
+      ${sending ? `<div class="callout info"><span class="spinner"></span><div>Sending ${data.sender.done}/${data.sender.total}…</div></div>` : ""}
+      ${data.sender?.error && !sending ? `<div class="callout">${I.warn}<div>${esc(data.sender.error)}</div></div>` : ""}
+      <div class="tiles">
+        ${tile("Ready to send", count("ready"), count("ready") ? "select and click Send" : "nothing waiting", count("ready") ? "mid" : "")}
+        ${tile("No email found", count("no_email"), count("no_email") ? "type the address in" : "all have an email", count("no_email") ? "bad" : "")}
+        ${tile("Sent", count("sent") + count("already_sent"), "Google Form invites", count("sent") ? "good" : "")}
+      </div>
+      ${roles.length ? roles.map(r => {
+        const ready = r.shown.filter(i => i.status === "ready");
+        return `<section class="card" data-role="${esc(r.id)}">
+          <div class="card-head"><h2>${esc(r.name)} <span class="muted" style="font-weight:400">(${r.shown.length})</span></h2>
+            <div style="display:flex;gap:8px;align-items:center">
+              ${r.form_url ? `<a class="btn sm" href="${esc(safeUrl(r.form_url) || "#")}" target="_blank" rel="noopener noreferrer">Open form</a>`
+                : `<span class="tag bad">No Google Form link</span>`}
+              <button class="btn sm" data-edit-role="${esc(r.id)}">${r.form_url ? "Edit link & email" : "Add form link"}</button>
+              <button class="btn primary sm" data-send-role="${esc(r.id)}" ${ready.length && r.form_url && !sending ? "" : "disabled"}>Send to ${ready.length ? plural(ready.length, "ready applicant") : "ready"}</button>
+            </div></div>
+          <div class="table-wrap"><table>
+            <thead><tr><th class="check"><input type="checkbox" data-pick-role="${esc(r.id)}" aria-label="Select all ready in ${esc(r.name)}" ${ready.length && r.form_url ? "" : "disabled"}></th>
+              <th>Applicant</th><th>Email</th><th>Applied</th><th>Status</th><th></th></tr></thead>
+            <tbody>${r.shown.map(i => rowHtml(i, r)).join("")}</tbody></table></div></section>`;
+      }).join("") : `<div class="card"><div class="empty">${I.inbox}<strong>${all.length ? "All done" : "No applicants yet"}</strong>
+        ${all.length ? "Everyone fetched so far has been sent the form or dismissed." : "Click <b>Fetch from email</b> on the Resumes page; fetched applicants appear here."}</div></div>`}
+    </div>`;
+
+  const selBtn = $("#inv-send-sel");
+  const syncSel = () => { selBtn.disabled = sending || !invState.selected.size; selBtn.textContent = invState.selected.size ? `Send selected (${invState.selected.size})` : "Send selected"; };
+  syncSel();
+  const send = async (ids, label) => {
+    if (!ids.length) return;
+    if (!confirm(`Send the Google Form invite to ${plural(ids.length, "applicant")}${label ? ` (${label})` : ""}?`)) return;
+    try {
+      await api("/api/invites/send", { method: "POST", body: { ids } });
+      invState.selected.clear();
+      toast(`Sending ${plural(ids.length, "invite")}…`);
+      watchSending(view);
+    } catch (e) { toast(e.message, "error"); }
+    renderInvites(view, { quiet: true });
+  };
+
+  $("#inv-show").addEventListener("change", e => { invState.show = e.target.value; renderInvites(view, { quiet: true }); });
+  selBtn.addEventListener("click", () => send([...invState.selected]));
+  $$("[data-pick]", view).forEach(cb => cb.addEventListener("change", () => {
+    const id = Number(cb.dataset.pick);
+    cb.checked ? invState.selected.add(id) : invState.selected.delete(id);
+    syncSel();
+  }));
+  $$("[data-pick-role]", view).forEach(cb => cb.addEventListener("change", () => {
+    $$(`section[data-role="${CSS.escape(cb.dataset.pickRole)}"] [data-pick]`, view).forEach(x => {
+      x.checked = cb.checked;
+      cb.checked ? invState.selected.add(Number(x.dataset.pick)) : invState.selected.delete(Number(x.dataset.pick));
+    });
+    syncSel();
+  }));
+  $$("[data-send-role]", view).forEach(b => b.addEventListener("click", () => {
+    const r = data.roles.find(x => x.id === b.dataset.sendRole);
+    send(r.items.filter(i => i.status === "ready").map(i => i.id), r.name);
+  }));
+  $$("[data-send-one]", view).forEach(b => b.addEventListener("click", () => send([Number(b.dataset.sendOne)])));
+  $$("[data-edit-role]", view).forEach(b => b.addEventListener("click", () => {
+    const r = data.roles.find(x => x.id === b.dataset.editRole);
+    inviteDialog(r, () => renderInvites(view, { quiet: true }));
+  }));
+  const patch = async (id, body, okMsg) => {
+    try { await api(`/api/invites/${id}`, { method: "PATCH", body }); if (okMsg) toast(okMsg, "success"); }
+    catch (e) { toast(e.message, "error"); }
+    renderInvites(view, { quiet: true });
+    loadInviteBadge();
+  };
+  $$("[data-dismiss]", view).forEach(b => b.addEventListener("click", () => patch(b.dataset.dismiss, { dismiss: true })));
+  $$("[data-restore]", view).forEach(b => b.addEventListener("click", () => patch(b.dataset.restore, { restore: true })));
+  $$(".inv-email", view).forEach(input => {
+    const id = input.closest("tr").dataset.inv, before = input.value.trim();
+    const commit = () => { const v = input.value.trim(); if (v !== before) patch(id, { email: v }, v ? "Email saved" : "Email cleared"); };
+    input.addEventListener("change", commit);
+    input.addEventListener("keydown", e => { if (e.key === "Enter") input.blur(); });
+  });
+  if (sending) watchSending(view);
+}
+
+function watchSending(view) {
+  if (invState.poll) return;
+  invState.poll = setInterval(async () => {
+    let st;
+    try { st = await api("/api/invites/status"); } catch { return; }
+    if (!location.hash.startsWith("#/invites")) { clearInterval(invState.poll); invState.poll = null; return; }
+    if (st.running) return renderInvites(view, { quiet: true });
+    clearInterval(invState.poll); invState.poll = null;
+    if (st.error) toast(st.error, "error");
+    else toast(`Google Form sent to ${plural(st.sent, "applicant")}${st.skipped ? ` · ${st.skipped} had it already` : ""}${st.failed ? ` · ${st.failed} failed` : ""}`, st.failed ? "error" : "success");
+    loadInviteBadge();
+    renderInvites(view, { quiet: true });
+  }, 2000);
+}

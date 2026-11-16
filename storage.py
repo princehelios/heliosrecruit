@@ -123,6 +123,27 @@ CREATE TABLE IF NOT EXISTS form_pending (
     filled_at         TEXT,                  -- set when a matching response appears
     seen              INTEGER NOT NULL DEFAULT 0  -- 1 = "form filled" notification read
 );
+
+-- Applicants fetched from email who should get the position's Google Form.
+-- Nothing is sent until someone reviews the list and clicks Send.
+CREATE TABLE IF NOT EXISTS form_invites (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id         TEXT UNIQUE,             -- the resume in WorkDrive
+    file_name       TEXT,
+    role_folder_id  TEXT NOT NULL,
+    role_name       TEXT NOT NULL,
+    candidate       TEXT NOT NULL,
+    email           TEXT,                    -- where the invite goes (editable)
+    email_source    TEXT,                    -- resume | indeed | manual
+    other_emails    TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL,           -- ready | no_email | sending | sent | already_sent | failed | dismissed
+    error           TEXT,
+    applied_at      TEXT,                    -- date of the application email
+    created_at      TEXT NOT NULL,
+    sent_at         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_invites_status ON form_invites(status);
 """
 
 
@@ -182,6 +203,9 @@ def _conn():
 _MIGRATIONS = {
     "job_descriptions": {
         "form_sheet_url": "TEXT",                   # role's Google Form response sheet
+        "form_url": "TEXT",                         # the Google Form itself (sent to applicants)
+        "invite_subject": "TEXT",                   # invite email template (NULL = default)
+        "invite_body": "TEXT",
     },
     "runs": {
         "form_pending": "INTEGER NOT NULL DEFAULT 0",  # resumes parked until the form is filled
@@ -260,10 +284,45 @@ def set_form_sheet(role_folder_id: str, role_name: str, url: str | None) -> dict
     return get_jd(role_folder_id)
 
 
+def set_invite_settings(role_folder_id: str, role_name: str, form_url: str | None,
+                        subject: str | None, body: str | None) -> dict:
+    """Saves a position's Google Form link and invite email template. Like the
+    sheet link, works before the JD is written."""
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO job_descriptions (role_folder_id, role_name, jd_text, pass_threshold,
+                                             form_url, invite_subject, invite_body, updated_at)
+               VALUES (?, ?, '', ?, ?, ?, ?, ?)
+               ON CONFLICT(role_folder_id) DO UPDATE SET
+                 role_name = excluded.role_name, form_url = excluded.form_url,
+                 invite_subject = excluded.invite_subject, invite_body = excluded.invite_body,
+                 updated_at = excluded.updated_at""",
+            (role_folder_id, role_name, config.BAND_MEDIUM, form_url or None, subject or None, body or None, now()),
+        )
+    return get_jd(role_folder_id)
+
+
+def restore_role_settings(role_folder_id: str, role_name: str, s: dict) -> bool:
+    """Re-creates a position's row from its WorkDrive settings file. Only fills
+    a missing row - never overwrites anything saved in this database."""
+    with _conn() as c:
+        cur = c.execute(
+            """INSERT OR IGNORE INTO job_descriptions (role_folder_id, role_name, jd_text, pass_threshold,
+                   form_sheet_url, form_url, invite_subject, invite_body, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (role_folder_id, role_name, s.get("jd_text") or "", config.BAND_MEDIUM,
+             s.get("form_sheet_url") or None, s.get("form_url") or None,
+             s.get("invite_subject") or None, s.get("invite_body") or None,
+             s.get("updated_at") or now()),
+        )
+        return cur.rowcount > 0
+
+
 def rename_role(role_folder_id: str, role_name: str) -> None:
     with _conn() as c:
         c.execute("UPDATE job_descriptions SET role_name = ? WHERE role_folder_id = ?", (role_name, role_folder_id))
         c.execute("UPDATE form_pending SET role_name = ? WHERE role_folder_id = ?", (role_name, role_folder_id))
+        c.execute("UPDATE form_invites SET role_name = ? WHERE role_folder_id = ?", (role_name, role_folder_id))
 
 
 # ---------------------------------------------------------------- runs
@@ -614,6 +673,78 @@ def mark_email_fetched(message_id: str, position: str, candidate: str, file_name
             "VALUES (?, ?, ?, ?, ?, ?)",
             (message_id, position, candidate, file_name, file_id, now()),
         )
+
+
+# ---------------------------------------------------------------- Google Form invites
+
+def _decode_invite(r) -> dict:
+    d = dict(r)
+    d["other_emails"] = json.loads(d.get("other_emails") or "[]")
+    return d
+
+
+def add_invite(*, file_id, file_name, role_folder_id, role_name, candidate, email, email_source,
+               other_emails, applied_at) -> int | None:
+    """One row per fetched resume; a second fetch of the same file is ignored."""
+    with _conn() as c:
+        cur = c.execute(
+            """INSERT OR IGNORE INTO form_invites (file_id, file_name, role_folder_id, role_name, candidate,
+                   email, email_source, other_emails, status, applied_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (file_id, file_name, role_folder_id, role_name, candidate, email or None, email_source or None,
+             json.dumps(other_emails or []), "ready" if email else "no_email", applied_at, now()),
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+
+def get_invite(invite_id: int):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM form_invites WHERE id = ?", (invite_id,)).fetchone()
+        return _decode_invite(r) if r else None
+
+
+def list_invites(include_done: bool = True) -> list:
+    sql = "SELECT * FROM form_invites"
+    if not include_done:
+        sql += " WHERE status NOT IN ('sent', 'already_sent', 'dismissed')"
+    with _conn() as c:
+        return [_decode_invite(r) for r in c.execute(sql + " ORDER BY applied_at DESC, id DESC")]
+
+
+def update_invite(invite_id: int, **fields) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with _conn() as c:
+        c.execute(f"UPDATE form_invites SET {cols} WHERE id = ?", (*fields.values(), invite_id))
+
+
+def claim_invites(ids: list[int]) -> list[dict]:
+    """Marks the given ready/failed invites as 'sending' and returns them, so a
+    double click (or two people) can never send the same invite twice."""
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    with _conn() as c:
+        rows = [_decode_invite(r) for r in c.execute(
+            f"SELECT * FROM form_invites WHERE id IN ({marks}) AND status IN ('ready', 'failed') AND email IS NOT NULL",
+            ids)]
+        if rows:
+            c.execute(f"UPDATE form_invites SET status = 'sending', error = NULL WHERE id IN "
+                      f"({','.join('?' * len(rows))})", [r["id"] for r in rows])
+    return rows
+
+
+def reset_stuck_invites() -> int:
+    """'sending' rows left by a restart mid-send go back to 'ready' (the Sent
+    folder check stops a real duplicate if one did go out)."""
+    with _conn() as c:
+        return c.execute("UPDATE form_invites SET status = 'ready' WHERE status = 'sending'").rowcount
+
+
+def invites_ready_count() -> int:
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM form_invites WHERE status = 'ready'").fetchone()[0]
 
 
 # ---------------------------------------------------------------- Google Form pending
