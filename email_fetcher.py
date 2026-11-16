@@ -51,6 +51,10 @@ class EmailFetchError(Exception):
     pass
 
 
+class IndeedBlockedError(EmailFetchError):
+    """Indeed showed a bot check / sign-in page instead of the resume."""
+
+
 # Parallel Chrome tabs. Each one costs roughly 80-150 MB, so on a 512 MB
 # instance this must be 1 - four tabs is what the OOM killer eats first.
 # render.yaml sets FETCH_TABS; locally it stays at 4.
@@ -288,6 +292,29 @@ async def _launch_browser(pw):
     return browser, ctx
 
 
+_LOGIN_HINTS = re.compile(r"sign in|log in|create an account|continue with google|enter your email", re.I)
+_BOT_HINTS = re.compile(r"just a moment|verify you are human|are you a robot|security check|captcha|"
+                        r"checking your browser|unusual traffic|access denied|blocked", re.I)
+
+
+async def _describe_page(page) -> str:
+    """One line on why there's no Download button on the page."""
+    try:
+        title = (await page.title()).strip()
+        text = " ".join((await page.inner_text("body", timeout=5000)).split())
+    except Exception:  # noqa: BLE001
+        title, text = "", ""
+    where = urlparse(page.url).netloc + urlparse(page.url).path
+    seen = f"{title!r} at {where}" if title else where
+    if _BOT_HINTS.search(title + " " + text[:600]):
+        raise IndeedBlockedError(f"Indeed showed a bot check instead of the resume ({seen}). Indeed blocks this server's IP; "
+                "fetch from a computer, or download the resume from Indeed and use Upload resumes.")
+    if _LOGIN_HINTS.search(title + " " + text[:600]) and "download" not in text.lower():
+        raise IndeedBlockedError(f"Indeed asked to sign in instead of showing the resume ({seen}). The link only opens for a "
+                "logged-in employer account; download it from Indeed and use Upload resumes.")
+    return f"No Download button on the resume page ({seen}): {text[:160]}"
+
+
 async def _download_tab(browser, link: str):
     """One Indeed resume through its own tab, with one retry (a rate-limit 'Blocked'
     page or a slow load). Returns (bytes, ext) or an EmailFetchError."""
@@ -301,7 +328,15 @@ async def _download_tab(browser, link: str):
                 await asyncio.sleep(5 * (attempt + 1))
                 continue
             btn = page.get_by_text("Download", exact=True).first
-            await btn.wait_for(timeout=30000)
+            try:
+                await btn.wait_for(timeout=30000)
+            except PWError:
+                # Say what Indeed showed instead (a sign-in page, a bot check...)
+                # so the log explains the failure, then don't retry the same page.
+                try:
+                    return EmailFetchError(await _describe_page(page))
+                except IndeedBlockedError as blocked:
+                    return blocked
             async with page.expect_download(timeout=60000) as dl:
                 await btn.click()
             with open(await (await dl.value).path(), "rb") as f:
@@ -489,6 +524,9 @@ async def _pipeline(jobs: list[dict], finish) -> None:
     loop = asyncio.get_running_loop()
     pool = ThreadPoolExecutor(max_workers=_UPLOAD_WORKERS)
     sem = asyncio.Semaphore(_BROWSER_TABS)
+    # Indeed blocking this server: after a few blocked pages with no success,
+    # skip the rest at once instead of spending ~1 minute on each.
+    trip = {"blocked": 0, "ok": 0, "error": None}
     try:
         for i in range(0, len(jobs), _CHROME_BATCH):
             chunk = jobs[i:i + _CHROME_BATCH]
@@ -511,9 +549,19 @@ async def _pipeline(jobs: list[dict], finish) -> None:
                         out = e
                 elif ctx is None:
                     out = launch_err
+                elif trip["error"]:
+                    out = trip["error"]
                 else:
                     async with sem:
-                        out = await _download_tab(ctx, job["link"])
+                        out = trip["error"] or await _download_tab(ctx, job["link"])
+                    if isinstance(out, IndeedBlockedError):
+                        trip["blocked"] += 1
+                        if trip["blocked"] >= 3 and not trip["ok"] and not trip["error"]:
+                            trip["error"] = EmailFetchError(f"Skipped: Indeed is blocking this server. {out}")
+                            storage.log("warn", "Email fetch: Indeed blocked 3 resumes in a row - skipping the "
+                                                "rest of this run. They stay unfetched and are retried next time.")
+                    elif not isinstance(out, Exception):
+                        trip["ok"] += 1
                 await loop.run_in_executor(pool, finish, job, out)
 
             try:
