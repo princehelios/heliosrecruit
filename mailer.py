@@ -12,6 +12,7 @@ marked already_sent instead. The Sent folder survives redeploys, so this
 holds even when the database has been wiped.
 """
 import imaplib
+import os
 import re
 import smtplib
 import threading
@@ -133,7 +134,12 @@ def _smtp() -> smtplib.SMTP_SSL:
         s = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT, timeout=30)
         s.login(snd["address"], snd["password"])
         return s
+    except smtplib.SMTPAuthenticationError as e:
+        raise MailError(f"Gmail refused the login for {snd['address']}: {e}")
     except (smtplib.SMTPException, OSError) as e:
+        if os.getenv("RENDER") and isinstance(e, OSError):
+            raise MailError("Email can't be sent from the website: Render's free plan blocks outgoing email "
+                            f"(SMTP) since Sept 2025. ({e})")
         raise MailError(f"Could not log in to Gmail to send as {snd['address']}: {e}")
 
 

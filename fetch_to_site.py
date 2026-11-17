@@ -17,8 +17,8 @@ Run:
     python fetch_to_site.py --days 30       # look further back
     python fetch_to_site.py --limit 5       # only the first 5 (a quick test)
 
-Safe to run again any time: mails the website already has are skipped, and
-nothing is sent to applicants (sending the Google Form stays a button on the site).
+Safe to run again any time: mails the website already has are skipped (and
+marked as read in Gmail, so unread = still to fetch), and nothing is sent to applicants (sending the Google Form stays a button on the site).
 """
 import argparse
 import os
@@ -84,6 +84,7 @@ def main() -> int:
     print(f"{len(jobs)} new resume(s) to fetch.\n")
 
     counts = {"saved": 0, "skipped": 0, "failed": 0}
+    done_mids: list[str] = []
     started = time.time()
 
     def finish(job, out):
@@ -101,6 +102,8 @@ def main() -> int:
                 r = http.post(f"{site}/api/import/resume", data=data,
                               files={"file": (f"{job['name']}{ext}", content)}, timeout=180)
                 body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                if r.ok:
+                    done_mids.append(job["mid"])
                 if r.ok and body.get("skipped"):
                     counts["skipped"] += 1
                     print(f"{label}: already on the website")
@@ -118,6 +121,9 @@ def main() -> int:
                 time.sleep(5 * (attempt + 1))
 
     asyncio.run(ef._pipeline(jobs, finish))
+    marked = ef.mark_read(done_mids)   # unread in Gmail = not on the website yet
+    if marked:
+        print(f"Marked {marked} application mail(s) as read in Gmail.")
     mins = (time.time() - started) / 60
     print(f"\nDone in {mins:.0f} min: {counts['saved']} saved, {counts['skipped']} already there, "
           f"{counts['failed']} failed.")

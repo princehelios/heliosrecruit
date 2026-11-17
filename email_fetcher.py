@@ -59,6 +59,14 @@ class IndeedBlockedError(EmailFetchError):
 # instance this must be 1 - four tabs is what the OOM killer eats first.
 # render.yaml sets FETCH_TABS; locally it stays at 4.
 _BROWSER_TABS = max(1, int(os.getenv("FETCH_TABS", "4")))
+# Indeed answers Render's servers with a bot check, and Chrome on a 512 MB
+# instance can take the whole server down. So on Render, Indeed resumes are
+# left to the fetch helper (fetch_to_site.py) unless FETCH_INDEED=1.
+_INDEED_HERE = os.getenv("FETCH_INDEED", "0" if os.getenv("RENDER") else "1").strip().lower() in ("1", "true", "yes", "on")
+# Mark an application mail as read once its resume is saved, so unread = still to do.
+_MARK_READ = os.getenv("MARK_FETCHED_READ", "1").strip().lower() in ("1", "true", "yes", "on")
+HELPER_HINT = ("Indeed blocks the website's server, so Indeed resumes are fetched from a computer: "
+               "run  python fetch_to_site.py  in the recruit folder.")
 _CHROME_BATCH = 10     # restart Chrome after this many resumes (frees leaked memory)
 _UPLOAD_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "4")))  # parallel WorkDrive uploads
 _IMAP_BATCH = 20       # mail bodies fetched per IMAP call
@@ -477,7 +485,9 @@ def _scan(known=None) -> list[dict]:
                               "Check the App Password and that IMAP is enabled in Gmail.")
     jobs = []
     try:
-        imap.select("INBOX", readonly=True)  # never changes read/unread state
+        # Bodies are read with BODY.PEEK, so nothing turns read except the
+        # mails we mark below (already handled ones).
+        imap.select("INBOX", readonly=not _MARK_READ)
         since = (datetime.now() - timedelta(days=config.EMAIL_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
         typ, data = imap.search(None, "SINCE", since, "SUBJECT", f'"{config.EMAIL_SUBJECT_FILTER}"')
         ids = data[0].split() if typ == "OK" and data and data[0] else []
@@ -487,6 +497,12 @@ def _scan(known=None) -> list[dict]:
         else:
             done = set(known([m for m in mids.values() if m]))
         new = [n for n in ids if not (mids.get(n) and mids[n] in done)]
+        handled = [n for n in ids if mids.get(n) and mids[n] in done]
+        if _MARK_READ and handled:
+            try:
+                imap.store(b",".join(handled).decode(), "+FLAGS", "(\\Seen)")
+            except imaplib.IMAP4.error as e:
+                storage.log("warn", f"Could not mark handled application mails as read: {e}")
 
         for i in range(0, len(new), _IMAP_BATCH):  # bodies in batches, not one round trip each
             batch = new[i:i + _IMAP_BATCH]
@@ -520,6 +536,35 @@ def _scan(known=None) -> list[dict]:
         except Exception:
             pass
     return jobs
+
+
+def mark_read(message_ids: list[str]) -> int:
+    """Marks these application mails as read in Gmail (after their resume was
+    saved). Never raises: a failure only means they stay unread."""
+    ids = [m for m in dict.fromkeys(message_ids) if m and "|" not in m]   # "date|subject" = no real Message-ID
+    if not (_MARK_READ and ids):
+        return 0
+    try:
+        imap = imaplib.IMAP4_SSL(config.EMAIL_IMAP_HOST, timeout=60)
+        imap.login(config.EMAIL_ADDRESS, config.EMAIL_APP_PASSWORD)
+        try:
+            imap.select("INBOX")
+            nums = []
+            for mid in ids:
+                typ, data = imap.search(None, "HEADER", "Message-ID", f'"{mid}"')
+                if typ == "OK" and data and data[0]:
+                    nums += data[0].split()
+            if nums:
+                imap.store(b",".join(nums).decode(), "+FLAGS", "(\\Seen)")
+            return len(nums)
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+    except (imaplib.IMAP4.error, OSError) as e:
+        storage.log("warn", f"Resumes saved, but marking their mails as read failed: {e}")
+        return 0
 
 
 async def _pipeline(jobs: list[dict], finish) -> None:
@@ -586,10 +631,19 @@ async def _pipeline(jobs: list[dict], finish) -> None:
 def _run() -> None:
     try:
         jobs = _scan()
+        indeed_left = 0
+        if not _INDEED_HERE:
+            indeed_left = sum(1 for j in jobs if _is_indeed(j["link"]))
+            jobs = [j for j in jobs if not _is_indeed(j["link"])]
+            if indeed_left:
+                storage.log("info", f"Email fetch: {indeed_left} Indeed application(s) waiting. {HELPER_HINT}")
         with _state_lock:
             _state["total"] += len(jobs)
             _state["phase"] = "downloading"
+            if indeed_left and not jobs:
+                _state["error"] = f"{indeed_left} Indeed application(s) waiting. {HELPER_HINT}"
         cache: dict = {}
+        saved_mids: list[str] = []
 
         def finish(job, out):
             item = {"subject": job["subject"], "candidate": job["name"], "position": job["position"]}
@@ -599,6 +653,7 @@ def _run() -> None:
                 content, ext = out
                 filed = file_resume(job["position"], job["when"], f"{job['name']}{ext}", content, cache)
                 storage.mark_email_fetched(job["mid"], job["position"], job["name"], filed["file_name"], filed["file_id"])
+                saved_mids.append(job["mid"])
                 storage.log("info", f"Email fetch: {job['name']} -> {filed['folder']}")
                 item.update(ok=True, **filed)
                 try:
@@ -615,6 +670,7 @@ def _run() -> None:
 
         if jobs:
             asyncio.run(_pipeline(jobs, finish))
+        mark_read(saved_mids)
         with _state_lock:
             s, f = _state["saved"], _state["failed"]
         storage.log("info", f"Email fetch finished: {s} saved, {f} failed.")
