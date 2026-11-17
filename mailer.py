@@ -26,7 +26,7 @@ import storage
 
 INVITE_HEADER = "X-Screener-Invite"
 _send_lock = threading.Lock()
-_state = {"running": False, "total": 0, "done": 0, "sent": 0, "skipped": 0, "failed": 0, "error": None}
+_state = {"running": False, "kind": "invites", "total": 0, "done": 0, "sent": 0, "skipped": 0, "failed": 0, "error": None}
 
 
 @forksafe.after_fork
@@ -108,7 +108,7 @@ def template_for(jd: dict | None) -> tuple[str, str]:
             (jd.get("invite_body") or "").strip() or config.DEFAULT_INVITE_BODY)
 
 
-def build(to: str, subject: str, body: str, role_folder_id: str) -> EmailMessage:
+def build(to: str, subject: str, body: str, role_folder_id: str | None) -> EmailMessage:
     s = sender()
     msg = EmailMessage()
     msg["From"] = formataddr((s["name"], s["address"]))
@@ -117,7 +117,8 @@ def build(to: str, subject: str, body: str, role_folder_id: str) -> EmailMessage
         msg["Reply-To"] = s["reply_to"]
     msg["Subject"] = subject
     msg["Message-ID"] = make_msgid(domain=s["address"].split("@")[-1])
-    msg[INVITE_HEADER] = role_folder_id
+    if role_folder_id:   # only Google Form invites carry it (the Sent-folder dedupe looks for it)
+        msg[INVITE_HEADER] = role_folder_id
     msg.set_content(body)
     return msg
 
@@ -212,7 +213,7 @@ def send_invites(ids: list[int]) -> dict:
         rows = storage.claim_invites(ids)
         if not rows:
             raise MailError("Nothing to send: the selected applicants are already sent, dismissed or have no email.")
-        _state.update(running=True, total=len(rows), done=0, sent=0, skipped=0, failed=0, error=None)
+        _state.update(running=True, kind="invites", total=len(rows), done=0, sent=0, skipped=0, failed=0, error=None)
     threading.Thread(target=_run, args=(rows,), daemon=True, name="invite-sender").start()
     return status()
 
@@ -268,3 +269,61 @@ def _one(r: dict, jd: dict | None, smtp, index: SentIndex) -> None:
         storage.update_invite(r["id"], status="failed", error=str(e))
         storage.log("warn", f"Google Form invite to {r['candidate']} <{r['email']}> failed: {e}")
         _state["failed"] += 1
+
+
+# ---------------------------------------------------------------- bulk email (any message, chosen applicants)
+
+def send_bulk(recipients: list[dict], subject: str, body: str) -> dict:
+    """Sends one message, personalised per applicant, in the background.
+    recipients: [{"email", "name", "position", "form_link"}]. Poll status()."""
+    subject, body = (subject or "").strip(), (body or "").strip()
+    if not subject or not body:
+        raise MailError("Write a subject and a message.")
+    good = [r for r in recipients if valid_email(r.get("email"))]
+    if not good:
+        raise MailError("None of the selected applicants has a valid email address.")
+    with _send_lock:
+        if _state["running"]:
+            raise MailError("Emails are already being sent - wait for that batch to finish.")
+        _state.update(running=True, kind="email", total=len(good), done=0, sent=0, skipped=0, failed=0, error=None)
+    threading.Thread(target=_run_bulk, args=(good, subject, body), daemon=True, name="bulk-sender").start()
+    return {**status(), "without_email": len(recipients) - len(good)}
+
+
+def _run_bulk(rows: list[dict], subject: str, body: str) -> None:
+    smtp = None
+    try:
+        try:
+            smtp = _smtp()
+        except MailError as e:
+            _state.update(error=str(e), failed=len(rows))
+            storage.log("error", f"Email '{subject}' not sent: {e}")
+            return
+        for r in rows:
+            values = {"name": r.get("name") or "", "position": r.get("position") or "", "form_link": r.get("form_link") or ""}
+            try:
+                smtp.send_message(build(r["email"], render(subject, **values), render(body, **values), None))
+                _state["sent"] += 1
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPException, OSError) as e:
+                # Gmail drops long connections: log in again once and retry this one.
+                try:
+                    try:
+                        smtp.quit()
+                    except Exception:
+                        pass
+                    smtp = _smtp()
+                    smtp.send_message(build(r["email"], render(subject, **values), render(body, **values), None))
+                    _state["sent"] += 1
+                except (MailError, smtplib.SMTPException, OSError) as e2:
+                    _state["failed"] += 1
+                    storage.log("warn", f"Email '{subject}' to {r.get('name')} <{r['email']}> failed: {e2 or e}")
+            _state["done"] += 1
+            time.sleep(1)  # stay well clear of Gmail's sending rate limit
+    finally:
+        if smtp:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
+        storage.log("info", f"Email '{subject}': {_state['sent']} sent, {_state['failed']} failed.")
+        _state["running"] = False

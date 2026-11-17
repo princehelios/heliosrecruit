@@ -1053,6 +1053,35 @@ def api_test_email_settings():
     return jsonify({"sent_to": snd["address"]})
 
 
+@app.get("/api/applicants/email")
+def api_applicants_email_template():
+    """The last bulk message, so the next one starts from it."""
+    return jsonify({"subject": storage.get_setting("bulk_subject") or "",
+                    "body": storage.get_setting("bulk_body") or "", "from": mailer.sender_label()})
+
+
+@app.post("/api/applicants/email")
+def api_applicants_email():
+    """Sends any message to the chosen applicants (not only the form invite)."""
+    body = request.get_json(force=True, silent=True) or {}
+    wanted = set(body.get("ids") or [])
+    jds = storage.list_jds()
+    rows = [{"email": a["email"], "name": a["name"], "position": a["position"],
+             "form_link": (jds.get(a["role_id"]) or {}).get("form_url") or ""}
+            for a in applicants.all_applicants() if a["id"] in wanted]
+    if not rows:
+        return _error("Select at least one applicant.", 400)
+    if "{form_link}" in (body.get("body") or "") and any(not r["form_link"] for r in rows):
+        return _error("The message uses {form_link}, but some selected applicants' positions have no Google Form. "
+                      "Remove {form_link} or pick a form for those positions.", 400)
+    out = mailer.send_bulk(rows, body.get("subject"), body.get("body"))
+    storage.set_setting("bulk_subject", (body.get("subject") or "").strip())
+    storage.set_setting("bulk_body", (body.get("body") or "").strip())
+    storage.log("info", f"Sending email '{body.get('subject', '').strip()}' to {out['total']} applicant(s)"
+                        + (f"; {out['without_email']} skipped (no email)." if out["without_email"] else "."))
+    return jsonify(out)
+
+
 @app.get("/api/applicants/progress")
 def api_applicants_progress():
     return jsonify({"queue": applicants.queue_status(), "sender": mailer.status(),
