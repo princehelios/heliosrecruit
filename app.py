@@ -1026,7 +1026,8 @@ def api_save_email_settings():
         password_to_use = password or (current["password"] if address == current["address"].lower() else "")
         if not password_to_use:
             return _error(f"Enter the Gmail App Password for {address} - Gmail only sends from an account it can log into.", 400)
-        mailer.check_login(address, password_to_use)
+        if not mailer.outbox_mode():   # Render can't reach Gmail SMTP; the helper's computer logs in instead
+            mailer.check_login(address, password_to_use)
     if password_to_use is None:
         storage.set_setting("sender_email", None)
         storage.set_setting("sender_app_password", None)
@@ -1044,13 +1045,43 @@ def api_test_email_settings():
     snd = mailer.sender()
     msg = mailer.build(snd["address"], "[TEST] Sender check from Resume Screener",
                        f"This is a test from Resume Screener.\n\nGoogle Form invites will come from: {mailer.sender_label()}"
-                       + (f"\nReplies go to: {snd['reply_to']}" if snd["reply_to"] else ""), "test")
+                       + (f"\nReplies go to: {snd['reply_to']}" if snd["reply_to"] else ""), None)
+    if mailer.outbox_mode():
+        storage.queue_mail(kind="email", to_email=snd["address"], to_name="", subject=msg["Subject"], body=msg.get_content())
+        return jsonify({"sent_to": snd["address"], "queued": True, "hint": mailer.OUTBOX_HINT})
     smtp = mailer._smtp()
     try:
         smtp.send_message(msg)
     finally:
         smtp.quit()
     return jsonify({"sent_to": snd["address"]})
+
+
+# ---------------------------------------------------------------- outbox (sent by fetch_to_site.py)
+
+@app.post("/api/outbox/claim")
+def api_outbox_claim():
+    """Hands queued emails to the helper on a computer, which sends them via Gmail."""
+    snd = mailer.sender()
+    return jsonify({"mails": storage.claim_outbox(), "sender": {"address": snd["address"], "name": snd["name"],
+                                                                 "reply_to": snd["reply_to"]}})
+
+
+@app.post("/api/outbox/<int:outbox_id>/result")
+def api_outbox_result(outbox_id):
+    body = request.get_json(force=True, silent=True) or {}
+    st = body.get("status")
+    if st not in ("sent", "already_sent", "failed"):
+        return _error("status must be sent, already_sent or failed.", 400)
+    row = storage.finish_outbox(outbox_id, st, (body.get("error") or "")[:500] or None)
+    if not row:
+        return _error("Unknown outbox mail.", 404)
+    what = "Google Form invite" if row["kind"] == "invite" else f"Email '{row['subject']}'"
+    if st == "sent":
+        storage.log("info", f"{what} sent to {row['to_name'] or ''} <{row['to_email']}> (from the computer helper).")
+    elif st == "failed":
+        storage.log("warn", f"{what} to <{row['to_email']}> failed: {body.get('error')}")
+    return jsonify({"ok": True})
 
 
 @app.get("/api/applicants/email")
@@ -1084,7 +1115,7 @@ def api_applicants_email():
 
 @app.get("/api/applicants/progress")
 def api_applicants_progress():
-    return jsonify({"queue": applicants.queue_status(), "sender": mailer.status(),
+    return jsonify({"queue": applicants.queue_status(), "sender": mailer.status(), "outbox": storage.outbox_counts(),
                     "fetch": {k: v for k, v in email_fetcher.status().items() if k != "results"}})
 
 
@@ -1134,7 +1165,7 @@ def api_save_invite_settings(role_folder_id):
 def api_test_invite(role_folder_id):
     role = _role_folder(role_folder_id)
     to = mailer.send_test(role_folder_id, role["name"], storage.get_jd(role_folder_id))
-    return jsonify({"sent_to": to})
+    return jsonify({"sent_to": to, "queued": mailer.outbox_mode()})
 
 
 @app.get("/api/invites")

@@ -48,6 +48,19 @@ def status() -> dict:
     return dict(_state)
 
 
+def outbox_mode() -> bool:
+    """True where SMTP is blocked (Render's free plan): mails are queued and
+    fetch_to_site.py sends them from a computer. MAIL_VIA=smtp|outbox overrides
+    (set MAIL_VIA=smtp after moving to a paid Render instance)."""
+    via = os.getenv("MAIL_VIA", "").strip().lower()
+    if via in ("smtp", "outbox"):
+        return via == "outbox"
+    return bool(os.getenv("RENDER"))
+
+
+OUTBOX_HINT = "They go out from Gmail the next time the helper runs on the Mac (python fetch_to_site.py)."
+
+
 # ---------------------------------------------------------------- sender (Settings page)
 
 def sender() -> dict:
@@ -203,6 +216,9 @@ def send_test(role_folder_id: str, role_name: str, jd: dict | None) -> str:
     msg = build(to, "[TEST] " + render(subject, name="Sample Applicant", position=role_name,
                                        form_link=form_url),
                 render(body, name="Sample Applicant", position=role_name, form_link=form_url), "test")
+    if outbox_mode():
+        storage.queue_mail(kind="email", to_email=to, to_name="", subject=msg["Subject"], body=msg.get_content())
+        return to
     s = _smtp()
     try:
         s.send_message(msg)
@@ -219,9 +235,35 @@ def send_invites(ids: list[int]) -> dict:
         rows = storage.claim_invites(ids)
         if not rows:
             raise MailError("Nothing to send: the selected applicants are already sent, dismissed or have no email.")
+        if outbox_mode():
+            return _queue_invites(rows)
         _state.update(running=True, kind="invites", total=len(rows), done=0, sent=0, skipped=0, failed=0, error=None)
     threading.Thread(target=_run, args=(rows,), daemon=True, name="invite-sender").start()
     return status()
+
+
+def _queue_invites(rows: list[dict]) -> dict:
+    jds = storage.list_jds()
+    queued = failed = 0
+    for r in rows:
+        jd = jds.get(r["role_folder_id"])
+        form_url = ((jd or {}).get("form_url") or "").strip()
+        if not form_url or not valid_email(r["email"]):
+            err = (f"'{r['role_name']}' has no Google Form - pick one on the Positions page." if not form_url
+                   else f"'{r['email']}' is not a valid email address.")
+            storage.update_invite(r["id"], status="failed", error=err)
+            failed += 1
+            continue
+        subject, body = template_for(jd)
+        values = {"name": r["candidate"], "position": r["role_name"], "form_link": form_url}
+        storage.queue_mail(kind="invite", invite_id=r["id"], to_email=r["email"], to_name=r["candidate"],
+                           subject=render(subject, **values), body=render(body, **values),
+                           invite_header=r["role_folder_id"])
+        storage.update_invite(r["id"], status="queued", error=None)
+        queued += 1
+    storage.log("info", f"Google Form queued for {queued} applicant(s)" + (f", {failed} failed" if failed else "")
+                        + f". {OUTBOX_HINT}")
+    return {**status(), "queued": queued, "failed": failed, "outbox": True}
 
 
 def _run(rows: list[dict]) -> None:
@@ -288,6 +330,13 @@ def send_bulk(recipients: list[dict], subject: str, body: str) -> dict:
     good = [r for r in recipients if valid_email(r.get("email"))]
     if not good:
         raise MailError("None of the selected applicants has a valid email address.")
+    if outbox_mode():
+        for r in good:
+            values = {"name": r.get("name") or "", "position": r.get("position") or "", "form_link": r.get("form_link") or ""}
+            storage.queue_mail(kind="email", to_email=r["email"], to_name=r.get("name") or "",
+                               subject=render(subject, **values), body=render(body, **values))
+        return {**status(), "total": len(good), "queued": len(good), "outbox": True,
+                "without_email": len(recipients) - len(good)}
     with _send_lock:
         if _state["running"]:
             raise MailError("Emails are already being sent - wait for that batch to finish.")

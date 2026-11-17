@@ -295,4 +295,12 @@ python fetch_to_site.py --limit 5  # quick test
 ```
 
 Needs `EMAIL_APP_PASSWORD` in `.env`. Safe to re-run: mails already on the
-website are skipped. Nothing is emailed to applicants.
+website are skipped, and each saved resume's mail is marked read in Gmail.
+
+### Sending email (Google Form, bulk email)
+
+Render's free plan blocks outgoing SMTP (since Sept 2025), so on Render the
+website **queues** emails and the same helper sends them from Gmail with the
+App Password: `python fetch_to_site.py` (fetch + send) or `--send-only`.
+Invites already in Gmail's Sent folder are never sent twice. On a paid Render
+instance set `MAIL_VIA=smtp` and the website sends directly again.

@@ -264,6 +264,24 @@ _FORMS_SCHEMA = """
 -- Google Forms, set up once on the Forms page and assigned to positions.
 -- A position copies its form's links into job_descriptions.form_url /
 -- form_sheet_url, so sending and form-checking read them as before.
+-- Emails waiting to be sent from a computer (Render's free plan blocks SMTP):
+-- fetch_to_site.py claims them, sends through Gmail, and reports back.
+CREATE TABLE IF NOT EXISTS outbox (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,            -- invite | email
+    invite_id       INTEGER,                  -- form_invites row (kind invite)
+    to_email        TEXT NOT NULL,
+    to_name         TEXT,
+    subject         TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    invite_header   TEXT,                     -- X-Screener-Invite value (dedupe in the Sent folder)
+    status          TEXT NOT NULL DEFAULT 'queued',   -- queued | sending | sent | already_sent | failed
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    claimed_at      TEXT,
+    sent_at         TEXT
+);
+
 CREATE TABLE IF NOT EXISTS forms (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
@@ -962,6 +980,54 @@ def claim_invites(ids: list[int]) -> list[dict]:
             c.execute(f"UPDATE form_invites SET status = 'sending', error = NULL WHERE id IN "
                       f"({','.join('?' * len(rows))})", [r["id"] for r in rows])
     return rows
+
+
+# ---------------------------------------------------------------- outbox
+
+def queue_mail(*, kind: str, to_email: str, to_name: str, subject: str, body: str,
+               invite_id: int | None = None, invite_header: str | None = None) -> int:
+    with _conn() as c:
+        return c.execute(
+            """INSERT INTO outbox (kind, invite_id, to_email, to_name, subject, body, invite_header, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (kind, invite_id, to_email, to_name, subject, body, invite_header, now())).lastrowid
+
+
+def claim_outbox(limit: int = 200, stale_minutes: int = 30) -> list:
+    """Hands queued mails (and ones claimed long ago by a run that died) to the
+    sender, marking them 'sending' so two runs never send the same mail."""
+    cutoff = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - stale_minutes * 60,
+                                    timezone.utc).isoformat(timespec="seconds")
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute(
+            """SELECT * FROM outbox WHERE status = 'queued' OR (status = 'sending' AND claimed_at < ?)
+               ORDER BY id LIMIT ?""", (cutoff, limit))]
+        if rows:
+            c.execute(f"UPDATE outbox SET status = 'sending', claimed_at = ? WHERE id IN ({','.join('?' * len(rows))})",
+                      [now(), *[r["id"] for r in rows]])
+    return rows
+
+
+def finish_outbox(outbox_id: int, status: str, error: str | None = None):
+    """Records the result; an invite row follows its mail. Returns the row."""
+    with _conn() as c:
+        row = _row(c.execute("SELECT * FROM outbox WHERE id = ?", (outbox_id,)).fetchone())
+        if not row:
+            return None
+        c.execute("UPDATE outbox SET status = ?, error = ?, sent_at = ? WHERE id = ?",
+                  (status, error, now() if status in ("sent", "already_sent") else None, outbox_id))
+        if row["invite_id"]:
+            if status in ("sent", "already_sent"):
+                c.execute("UPDATE form_invites SET status = ?, sent_at = ?, error = NULL WHERE id = ?",
+                          (status, now(), row["invite_id"]))
+            else:
+                c.execute("UPDATE form_invites SET status = 'failed', error = ? WHERE id = ?", (error, row["invite_id"]))
+    return row
+
+
+def outbox_counts() -> dict:
+    with _conn() as c:
+        return {r["status"]: r["n"] for r in c.execute("SELECT status, COUNT(*) AS n FROM outbox GROUP BY status")}
 
 
 def reset_stuck_invites() -> int:

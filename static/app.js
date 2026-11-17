@@ -2271,7 +2271,7 @@ function inviteDialog(role, onSaved) {
       try {
         await save();
         const r = await api(`/api/roles/${encodeURIComponent(role.id)}/invite/test`, { method: "POST" });
-        toast(`Test email sent to ${r.sent_to} - check that inbox`, "success");
+        toast(r.queued ? `Test queued for ${r.sent_to}. ${OUTBOX_NOTE}` : `Test email sent to ${r.sent_to} - check that inbox`, "success");
       } catch (e) { toast(e.message, "error"); }
       busy(b, false, "Save & send test to me");
     });
@@ -2422,7 +2422,7 @@ function watchSending(view) {
 
 const hashParams = () => new URLSearchParams((location.hash.split("?")[1]) || "");
 const STEP_TAG = {
-  new: "blue", no_email: "bad", sent: "warn", filled: "purple", screening: "", qualified: "good",
+  new: "blue", no_email: "bad", queued: "warn", sent: "warn", filled: "purple", screening: "", qualified: "good",
   not_qualified: "", error: "bad",
 };
 const AP_TABS = [["all", "All"], ["new", "New: send form"], ["sent", "Waiting for form"],
@@ -2442,6 +2442,7 @@ function stepNote(a) {
   if (a.step === "new") return a.email_source === "indeed" ? "email from Indeed" : "email from resume";
   if (a.step === "no_email") return "type the email to send the form";
   if (a.step === "sent") return `form sent ${daysAgo(a.sent_at)}`;
+  if (a.step === "queued") return "goes out when the Mac helper runs";
   if (a.step === "filled") return `answered ${daysAgo(a.form_filled_at)}`;
   if (a.step === "screening") return "scoring resume + answers";
   if (a.step === "qualified") return a.source === "walkin" ? "walk-in · app only" : a.recruit_status === "saved" ? "in Zoho Recruit" : "Recruit save pending";
@@ -2483,7 +2484,7 @@ async function emailDialog(people, onSent) {
     try {
       const r = await api("/api/applicants/email", { method: "POST", body: { ids: people.map(a => a.id), subject, body } });
       closeModal();
-      toast(`Sending to ${plural(r.total, "applicant")}${r.without_email ? ` (${r.without_email} without email skipped)` : ""}…`, "success");
+      toast(`${r.outbox ? "Queued for" : "Sending to"} ${plural(r.total, "applicant")}${r.without_email ? ` (${r.without_email} without email skipped)` : ""}${r.outbox ? `. ${OUTBOX_NOTE}` : "…"}`, "success");
       onSent && onSent();
     } catch (e) { toast(e.message, "error"); b.disabled = false; b.textContent = `Send to ${plural(people.length, "applicant")}`; }
   });
@@ -2493,8 +2494,9 @@ async function sendForms(ids) {
   if (!ids.length) return;
   if (!confirm(`Send the Google Form to ${plural(ids.length, "applicant")}?`)) return false;
   try {
-    await api("/api/applicants/send-form", { method: "POST", body: { ids } });
-    toast(`Sending the Google Form to ${plural(ids.length, "applicant")}…`);
+    const r = await api("/api/applicants/send-form", { method: "POST", body: { ids } });
+    if (r.outbox) toast(`Google Form queued for ${plural(r.queued, "applicant")}${r.failed ? ` (${r.failed} failed)` : ""}. ${OUTBOX_NOTE}`, r.failed ? "error" : "success");
+    else toast(`Sending the Google Form to ${plural(ids.length, "applicant")}…`);
     return true;
   } catch (e) { toast(e.message, "error"); return false; }
 }
@@ -2509,13 +2511,17 @@ async function screenApplicants(ids) {
   } catch (e) { toast(e.message, "error"); return false; }
 }
 
+const OUTBOX_NOTE = "Render's free plan blocks sending email, so it goes out from your Gmail when the helper runs on the Mac (python fetch_to_site.py).";
+
 function progressCallout(p) {
-  const q = p.queue || {}, s = p.sender || {}, f = p.fetch || {};
+  const q = p.queue || {}, s = p.sender || {}, f = p.fetch || {}, o = p.outbox || {};
+  const waiting = (o.queued || 0) + (o.sending || 0);
+  const outboxNote = waiting ? `<div class="callout warn"><div><b>${plural(waiting, "email")} waiting to be sent.</b> ${OUTBOX_NOTE}</div></div>` : "";
   const parts = [];
   if (f.running) parts.push(`Fetching from Gmail${f.total ? ` ${f.done}/${f.total}` : "…"}`);
   if (s.running) parts.push(`${s.kind === "email" ? "Sending emails" : "Sending forms"} ${s.done}/${s.total}`);
   if (q.running) parts.push(`Screening${q.total ? ` ${q.total} applicant(s)` : "…"}`);
-  return parts.length ? `<div class="callout info"><span class="spinner"></span><div>${esc(parts.join(" · "))} - this page updates by itself.</div></div>` : "";
+  return (parts.length ? `<div class="callout info"><span class="spinner"></span><div>${esc(parts.join(" · "))} - this page updates by itself.</div></div>` : "") + outboxNote;
 }
 
 /* ---------------------------------------------------------------- Home */
@@ -3097,7 +3103,7 @@ async function renderSettings(view) {
   });
   $("#se-test").addEventListener("click", async () => {
     const b = $("#se-test"); busy(b, true, "Sending…");
-    try { const r = await api("/api/settings/email/test", { method: "POST" }); toast(`Test email sent to ${r.sent_to}`, "success"); }
+    try { const r = await api("/api/settings/email/test", { method: "POST" }); toast(r.queued ? `Test queued for ${r.sent_to}. ${OUTBOX_NOTE}` : `Test email sent to ${r.sent_to}`, "success"); }
     catch (e) { toast(e.message, "error"); }
     busy(b, false, "Send a test to the sender");
   });

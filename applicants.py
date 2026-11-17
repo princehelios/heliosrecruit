@@ -29,11 +29,11 @@ import pipeline
 import storage
 
 STEP_LABELS = {
-    "new": "New", "no_email": "No email", "sent": "Form sent", "filled": "Form filled",
+    "new": "New", "no_email": "No email", "queued": "Form queued", "sent": "Form sent", "filled": "Form filled",
     "screening": "Screening…", "qualified": "Qualified", "not_qualified": "Not qualified", "error": "Screening failed",
 }
 TABS = {  # tab -> steps it shows
-    "new": ("new", "no_email"), "sent": ("sent",), "filled": ("filled", "screening", "error"),
+    "new": ("new", "no_email"), "sent": ("queued", "sent"), "filled": ("filled", "screening", "error"),
     "qualified": ("qualified",), "not_qualified": ("not_qualified",),
 }
 
@@ -97,6 +97,8 @@ def all_applicants(include_dismissed: bool = False) -> list[dict]:
             a["step"] = "filled"
         elif i["status"] in ("sent", "already_sent"):
             a["step"] = "sent"
+        elif i["status"] == "queued":
+            a["step"] = "queued"
         elif i["status"] == "no_email" or not a["email"]:
             a["step"] = "no_email"
         else:
@@ -146,7 +148,7 @@ def home(range_key: str = "7") -> dict:
     qualified = [a for a in gmail if a["step"] == "qualified"]   # High/Medium split of the funnel's Qualified
     funnel = {
         "applied": len(gmail),
-        "form_sent": sum(1 for a in gmail if a["step"] not in ("new", "no_email")),
+        "form_sent": sum(1 for a in gmail if a["step"] not in ("new", "no_email", "queued")),
         "form_filled": sum(1 for a in gmail if a["form_filled_at"] or a["step"] in ("qualified", "not_qualified")),
         "screened": sum(1 for a in gmail if a["step"] in ("qualified", "not_qualified")),
         "qualified": sum(1 for a in gmail if a["step"] == "qualified"),
@@ -162,7 +164,7 @@ def home(range_key: str = "7") -> dict:
         group = [a for a in rows if a["source"] == key]
         sources[key] = {
             "received": len(group),
-            "form_sent": sum(1 for a in group if a["step"] not in ("new", "no_email") and key != "walkin"),
+            "form_sent": sum(1 for a in group if a["step"] not in ("new", "no_email", "queued") and key != "walkin"),
             "qualified": sum(1 for a in group if a["step"] == "qualified"),
             "in_recruit": sum(1 for a in group if a["recruit_status"] == "saved"),
         }
@@ -185,7 +187,7 @@ def home(range_key: str = "7") -> dict:
                                                 "send": 0, "screen": 0})
         p["applied"] += 1
         p[a["source"] if a["source"] in ("gmail", "upload", "walkin") else "gmail"] += 1
-        p["form_sent"] += 1 if a["source"] != "walkin" and a["step"] not in ("new", "no_email") else 0
+        p["form_sent"] += 1 if a["source"] != "walkin" and a["step"] not in ("new", "no_email", "queued") else 0
         p["in_recruit"] += 1 if a["recruit_status"] == "saved" else 0
         p["filled"] += 1 if (a["form_filled_at"] or a["step"] in ("qualified", "not_qualified")) else 0
         p["screened"] += 1 if a["step"] in ("qualified", "not_qualified") else 0
